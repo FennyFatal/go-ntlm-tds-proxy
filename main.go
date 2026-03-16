@@ -878,12 +878,20 @@ func introspectTokens(direction string, data []byte) {
 				return
 			}
 			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
-			pos += 2
-			if pos+4 <= len(data) {
-				errNum := binary.LittleEndian.Uint32(data[pos : pos+4])
-				log.Printf("%s:     token %s: errno=%d", direction, name, errNum)
+			// Dump full hex of error token data
+			endPos := pos + 2 + tlen
+			if endPos > len(data) {
+				endPos = len(data)
 			}
-			pos += tlen
+			log.Printf("%s:     token %s: hex=%s", direction, name, hex.EncodeToString(data[pos-1:endPos]))
+			pos += 2
+			if pos+6 <= len(data) {
+				errNum := binary.LittleEndian.Uint32(data[pos : pos+4])
+				state := data[pos+4]
+				severity := data[pos+5]
+				log.Printf("%s:     ERROR: number=%d state=%d severity=%d", direction, errNum, state, severity)
+			}
+			pos = endPos
 		case token == 0xAB: // INFO token
 			if pos+2 > len(data) {
 				return
