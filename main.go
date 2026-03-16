@@ -28,23 +28,39 @@ func main() {
 		log.Fatal("Must specify -remote flag with SQL Server address")
 	}
 
-	ln, err := net.Listen("tcp", *listenAddr)
+	// Listen on both IPv4 and IPv6 explicitly
+	ln4, err := net.Listen("tcp4", *listenAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", *listenAddr, err)
+		log.Fatalf("Failed to listen (IPv4) on %s: %v", *listenAddr, err)
 	}
-	defer ln.Close()
+	defer ln4.Close()
 
-	log.Printf("SQL NTLM Relay listening on %s, proxying to %s", *listenAddr, *remoteAddr)
+	ln6, err := net.Listen("tcp6", *listenAddr)
+	if err != nil {
+		log.Printf("Warning: could not listen on IPv6 %s: %v", *listenAddr, err)
+		ln6 = nil
+	} else {
+		defer ln6.Close()
+	}
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("Accept error: %v", err)
-			continue
+	log.Printf("SQL NTLM Relay listening on %s (IPv4+IPv6), proxying to %s", *listenAddr, *remoteAddr)
+
+	accept := func(ln net.Listener, tag string) {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Printf("[%s] Accept error: %v", tag, err)
+				return
+			}
+			log.Printf("New connection from %s (%s)", conn.RemoteAddr(), tag)
+			go handleConnection(conn)
 		}
-		log.Printf("New connection from %s", conn.RemoteAddr())
-		go handleConnection(conn)
 	}
+
+	if ln6 != nil {
+		go accept(ln6, "IPv6")
+	}
+	accept(ln4, "IPv4")
 }
 
 func handleConnection(clientConn net.Conn) {
