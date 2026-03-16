@@ -172,13 +172,16 @@ func handleConnection(clientConn net.Conn) {
 
 	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
 	log.Printf("[%s] Starting bidirectional relay", tag)
+	var closing atomic.Bool
 	done := make(chan struct{})
 	go func() {
-		relay(clientConn, serverConn, tag+"/server->client")
+		relay(clientConn, serverConn, tag+"/server->client", &closing)
+		closing.Store(true)
 		clientConn.Close()
 		close(done)
 	}()
-	relay(serverConn, clientConn, tag+"/client->server")
+	relay(serverConn, clientConn, tag+"/client->server", &closing)
+	closing.Store(true)
 	serverConn.Close()
 	<-done
 	log.Printf("[%s] Connection closed", tag)
@@ -190,18 +193,19 @@ type Credentials struct {
 	Password string
 }
 
-// LoginFields holds raw UTF-16LE field data from the client's LOGIN7 packet
-// to forward in the NTLM LOGIN7 we send to the server.
+// LoginFields holds data from the client's LOGIN7 packet to forward in the
+// NTLM LOGIN7 we send to the server.
 type LoginFields struct {
-	HostName   []byte
-	AppName    []byte
-	ServerName []byte
-	CltIntName []byte
-	Language   []byte
-	Database   []byte
-	PacketSize uint32
-	OptionFlags1 byte
-	OptionFlags3 byte
+	// FixedPrefix is the first 36 bytes of the LOGIN7 body (before offset/length pairs).
+	// Contains TDSVersion, PacketSize, ClientProgVer, ClientPID, ConnectionID,
+	// OptionFlags1-3, TypeFlags, ClientTimeZone, ClientLCID.
+	FixedPrefix []byte
+	HostName    []byte
+	AppName     []byte
+	ServerName  []byte
+	CltIntName  []byte
+	Language    []byte
+	Database    []byte
 }
 
 func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
@@ -273,11 +277,11 @@ func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
 		user = parts[1]
 	}
 
-	// Extract fields to forward to server
+	// Extract fields to forward to server — copy the raw fixed prefix (first 36 bytes)
+	// which includes TDS version, packet size, client version, PID, connection ID,
+	// all option/type flags, timezone, and collation LCID.
 	fields := &LoginFields{
-		PacketSize:   binary.LittleEndian.Uint32(loginData[8:12]),
-		OptionFlags1: loginData[24],
-		OptionFlags3: loginData[28],
+		FixedPrefix: append([]byte(nil), loginData[0:36]...),
 	}
 	fields.HostName, _ = readRawField(36, 38)
 	fields.AppName, _ = readRawField(48, 50)
@@ -555,22 +559,13 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 
 	login := make([]byte, fixedSize)
 
-	// TDS Version at offset 4 (TDS 7.4)
-	binary.LittleEndian.PutUint32(login[4:8], 0x74000004)
+	// Copy client's fixed prefix (first 36 bytes): TDS version, packet size,
+	// client version, PID, connection ID, all option/type flags, timezone, LCID
+	copy(login[0:36], fields.FixedPrefix)
 
-	// PacketSize at offset 8 — use client's requested size
-	pktSize := fields.PacketSize
-	if pktSize == 0 {
-		pktSize = 4096
-	}
-	binary.LittleEndian.PutUint32(login[8:12], pktSize)
-
-	// OptionFlags1 at offset 24: forward client's flags (byte order, charset, etc.)
-	login[24] = fields.OptionFlags1
-	// OptionFlags2 at offset 25: set fIntSecurity (0x80) for NTLM/SSPI
-	login[25] = 0x80
-	// OptionFlags3 at offset 28: forward client's flags
-	login[28] = fields.OptionFlags3
+	// Set fIntSecurity (0x80) in OptionFlags2 while preserving client's other flags
+	// (e.g. fODBC=0x02 which affects quoted identifier and ANSI null behavior)
+	login[25] |= 0x80
 
 	// Build variable data area with client's fields
 	// Order: HostName, UserName(empty), Password(empty), AppName, ServerName,
@@ -682,15 +677,22 @@ func extractSSPI(packet []byte) ([]byte, error) {
 	return nil, fmt.Errorf("no SSPI data found in packet")
 }
 
-func relay(dst, src net.Conn, direction string) {
+func relay(dst, src net.Conn, direction string, closing *atomic.Bool) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
 		if err != nil {
-			if err != io.EOF {
+			if err == io.EOF {
+				if *verbose {
+					log.Printf("%s: EOF", direction)
+				}
+			} else if closing.Load() {
+				// Expected error from the other direction shutting down
+				if *verbose {
+					log.Printf("%s: closing (%v)", direction, err)
+				}
+			} else {
 				log.Printf("%s read error: %v", direction, err)
-			} else if *verbose {
-				log.Printf("%s: EOF", direction)
 			}
 			return
 		}
@@ -700,7 +702,13 @@ func relay(dst, src net.Conn, direction string) {
 		}
 
 		if _, err := dst.Write(buf[:n]); err != nil {
-			log.Printf("%s write error: %v", direction, err)
+			if closing.Load() {
+				if *verbose {
+					log.Printf("%s: closing (%v)", direction, err)
+				}
+			} else {
+				log.Printf("%s write error: %v", direction, err)
+			}
 			return
 		}
 	}
