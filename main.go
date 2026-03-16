@@ -772,9 +772,6 @@ func relay(dst, src net.Conn, direction string, closing *atomic.Bool) {
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			if *verbose {
-				introspectRead(direction, buf[:n])
-			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				if closing.Load() {
 					if *verbose {
