@@ -629,22 +629,136 @@ func relay(dst, src net.Conn, direction string) {
 			return
 		}
 
-		if *verbose && n >= 8 {
-			pktType := buf[0]
-			pktStatus := buf[1]
-			pktLen := binary.BigEndian.Uint16(buf[2:4])
-			typeName := tdsPacketTypeName(pktType)
-			log.Printf("%s: %d bytes [type=0x%02x(%s) status=0x%02x len=%d]",
-				direction, n, pktType, typeName, pktStatus, pktLen)
-			if pktType == 0x04 && n > 8 { // Tabular result - log first token
-				log.Printf("%s:   first token=0x%02x", direction, buf[8])
-			}
-		} else if *verbose {
-			log.Printf("%s: %d bytes (fragment)", direction, n)
+		if *verbose {
+			introspectRead(direction, buf[:n])
 		}
 
 		if _, err := dst.Write(buf[:n]); err != nil {
 			log.Printf("%s write error: %v", direction, err)
+			return
+		}
+	}
+}
+
+func introspectRead(direction string, data []byte) {
+	log.Printf("%s: %d bytes total", direction, len(data))
+
+	// Walk all TDS packets in this read
+	offset := 0
+	pktNum := 0
+	for offset+8 <= len(data) {
+		pktNum++
+		pktType := data[offset]
+		pktStatus := data[offset+1]
+		pktLen := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		typeName := tdsPacketTypeName(pktType)
+
+		statusFlags := ""
+		if pktStatus&0x01 != 0 {
+			statusFlags += "EOM "
+		}
+		if pktStatus&0x04 != 0 {
+			statusFlags += "RESETCONN "
+		}
+		if pktStatus&0x08 != 0 {
+			statusFlags += "RESETCONNTRAN "
+		}
+		if statusFlags == "" {
+			statusFlags = "none"
+		}
+
+		log.Printf("%s:   pkt#%d @%d: type=0x%02x(%s) status=0x%02x(%s) len=%d",
+			direction, pktNum, offset, pktType, typeName, pktStatus, statusFlags, pktLen)
+
+		// Introspect tokens in TabularResult packets
+		if pktType == 0x04 {
+			end := offset + pktLen
+			if end > len(data) {
+				end = len(data)
+			}
+			if offset+8 < end {
+				introspectTokens(direction, data[offset+8:end])
+			}
+		}
+
+		if pktLen < 8 {
+			log.Printf("%s:   pkt#%d: INVALID len=%d, stopping introspection", direction, pktNum, pktLen)
+			break
+		}
+		offset += pktLen
+	}
+
+	if remainder := len(data) - offset; remainder > 0 {
+		log.Printf("%s:   %d trailing bytes (partial next packet)", direction, remainder)
+	}
+}
+
+func introspectTokens(direction string, data []byte) {
+	pos := 0
+	for pos < len(data) {
+		token := data[pos]
+		name := tdsTokenName(token)
+		pos++
+
+		switch {
+		case token == 0xAA: // ERROR token
+			if pos+2 > len(data) {
+				return
+			}
+			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			pos += 2
+			if pos+4 <= len(data) {
+				errNum := binary.LittleEndian.Uint32(data[pos : pos+4])
+				log.Printf("%s:     token %s: errno=%d", direction, name, errNum)
+			}
+			pos += tlen
+		case token == 0xAB: // INFO token
+			if pos+2 > len(data) {
+				return
+			}
+			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			pos += 2
+			if pos+4 <= len(data) {
+				infoNum := binary.LittleEndian.Uint32(data[pos : pos+4])
+				log.Printf("%s:     token %s: msgno=%d", direction, name, infoNum)
+			}
+			pos += tlen
+		case token == 0xAD: // LOGINACK
+			if pos+2 > len(data) {
+				return
+			}
+			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			log.Printf("%s:     token %s", direction, name)
+			pos += 2 + tlen
+		case token == 0xE3: // ENVCHANGE
+			if pos+2 > len(data) {
+				return
+			}
+			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			envType := byte(0)
+			if pos+2 < len(data) {
+				envType = data[pos+2]
+			}
+			log.Printf("%s:     token %s: type=%d", direction, name, envType)
+			pos += 2 + tlen
+		case token == 0xFD || token == 0xFE || token == 0xFF: // DONE tokens
+			if pos+8 <= len(data) {
+				status := binary.LittleEndian.Uint16(data[pos : pos+2])
+				log.Printf("%s:     token %s: status=0x%04x", direction, name, status)
+			}
+			pos += 12 // status(2) + curcmd(2) + rowcount(8) for TDS 7.2+
+		default:
+			// Variable-length token: try to read 2-byte length and skip
+			if pos+2 > len(data) {
+				log.Printf("%s:     token %s (0x%02x) at end", direction, name, token)
+				return
+			}
+			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			log.Printf("%s:     token %s (0x%02x) len=%d", direction, name, token, tlen)
+			pos += 2 + tlen
+		}
+
+		if pos < 0 || pos > len(data) {
 			return
 		}
 	}
@@ -674,5 +788,40 @@ func tdsPacketTypeName(t byte) string {
 		return "PreLogin"
 	default:
 		return "Unknown"
+	}
+}
+
+func tdsTokenName(t byte) string {
+	switch t {
+	case 0x81:
+		return "COLMETADATA"
+	case 0xA4:
+		return "ORDER"
+	case 0xA5:
+		return "ERROR_OLD"
+	case 0xAA:
+		return "ERROR"
+	case 0xAB:
+		return "INFO"
+	case 0xAD:
+		return "LOGINACK"
+	case 0xD1:
+		return "ROW"
+	case 0xD3:
+		return "NBCROW"
+	case 0xE3:
+		return "ENVCHANGE"
+	case 0xE5:
+		return "EED"
+	case 0xED:
+		return "SSPI"
+	case 0xFD:
+		return "DONE"
+	case 0xFE:
+		return "DONEPROC"
+	case 0xFF:
+		return "DONEINPROC"
+	default:
+		return fmt.Sprintf("UNKNOWN(0x%02x)", t)
 	}
 }
