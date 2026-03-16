@@ -203,6 +203,7 @@ type Credentials struct {
 // LoginFields holds data from the client's LOGIN7 packet to forward in the
 // NTLM LOGIN7 we send to the server.
 type LoginFields struct {
+	TDSVersion     uint32
 	PacketSize     uint32
 	OptionFlags1   byte
 	OptionFlags2   byte // client's original flags (we'll OR in fIntSecurity)
@@ -288,6 +289,7 @@ func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
 
 	// Extract fields to forward to server
 	fields := &LoginFields{
+		TDSVersion:     binary.LittleEndian.Uint32(loginData[4:8]),
 		PacketSize:     binary.LittleEndian.Uint32(loginData[8:12]),
 		OptionFlags1:   loginData[24],
 		OptionFlags2:   loginData[25],
@@ -598,13 +600,24 @@ func performNTLMAuth(conn net.Conn, creds *Credentials, fields *LoginFields, tag
 
 func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	// Build a TDS LOGIN7 packet with SSPI data for NTLM Type 1 (Negotiate)
-	// TDS 7.2+ requires a 94-byte fixed header (86 base + ibChangePassword/cchChangePassword + cbSSPILong)
-	const fixedSize = 94
+	// Header size depends on TDS version:
+	// - TDS 7.0/7.1: 86 bytes (base header)
+	// - TDS 7.2+: 94 bytes (includes cbSSPILong at offset 90)
+
+	// Extract major version from TDS version field (high byte)
+	majorVersion := (fields.TDSVersion >> 24) & 0xFF
+
+	var fixedSize int
+	if majorVersion >= 0x72 { // TDS 7.2+
+		fixedSize = 94
+	} else { // TDS 7.0/7.1
+		fixedSize = 86
+	}
 
 	login := make([]byte, fixedSize)
 
-	// TDS Version at offset 4 (TDS 7.4) — must match 94-byte header format
-	binary.LittleEndian.PutUint32(login[4:8], 0x74000004)
+	// TDS Version at offset 4 — forward client's requested version
+	binary.LittleEndian.PutUint32(login[4:8], fields.TDSVersion)
 
 	// PacketSize at offset 8 — use client's requested size
 	pktSize := fields.PacketSize
@@ -659,8 +672,10 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	binary.LittleEndian.PutUint16(login[86:88], uint16(emptyOff)) // ibChangePassword=86
 	binary.LittleEndian.PutUint16(login[88:90], 0)
 
-	// cbSSPILong at offset 90 (used when cbSSPI=0xFFFF; 0 otherwise)
-	binary.LittleEndian.PutUint32(login[90:94], 0)
+	// cbSSPILong at offset 90 (TDS 7.2+ only, used when cbSSPI=0xFFFF; 0 otherwise)
+	if fixedSize >= 94 {
+		binary.LittleEndian.PutUint32(login[90:94], 0)
+	}
 
 	// Append variable data to login record
 	login = append(login, varData...)
