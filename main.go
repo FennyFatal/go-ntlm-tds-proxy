@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -20,6 +21,7 @@ var (
 	listenAddr  = flag.String("listen", ":1433", "Address to listen on")
 	remoteAddr  = flag.String("remote", "", "Remote SQL Server address (host:port)")
 	verbose     = flag.Bool("v", false, "Verbose logging")
+	connCounter uint64
 )
 
 func main() {
@@ -53,7 +55,6 @@ func main() {
 				log.Printf("[%s] Accept error: %v", tag, err)
 				return
 			}
-			log.Printf("New connection from %s (%s)", conn.RemoteAddr(), tag)
 			go handleConnection(conn)
 		}
 	}
@@ -65,46 +66,48 @@ func main() {
 }
 
 func handleConnection(clientConn net.Conn) {
+	connID := atomic.AddUint64(&connCounter, 1)
+	tag := fmt.Sprintf("conn#%d", connID)
 	defer clientConn.Close()
 
-	log.Printf("Dialing remote %s...", *remoteAddr)
+	log.Printf("[%s] New connection from %s, dialing remote %s...", tag, clientConn.RemoteAddr(), *remoteAddr)
 	rawRemote, err := net.DialTimeout("tcp", *remoteAddr, 10*time.Second)
 	if err != nil {
-		log.Printf("Failed to connect to remote %s: %v", *remoteAddr, err)
+		log.Printf("[%s] Failed to connect to remote %s: %v", tag, *remoteAddr, err)
 		return
 	}
 	defer rawRemote.Close()
 
 	if *verbose {
-		log.Printf("Connected to remote server %s", *remoteAddr)
+		log.Printf("[%s] Connected to remote server %s", tag, *remoteAddr)
 	}
 
 	// Phase 1: Handle pre-login with both sides
-	clientPreLogin, err := readTDSPacket(clientConn, "client-prelogin")
+	clientPreLogin, err := readTDSPacket(clientConn, tag+"/client-prelogin")
 	if err != nil {
-		log.Printf("Failed to read client pre-login: %v", err)
+		log.Printf("[%s] Failed to read client pre-login: %v", tag, err)
 		return
 	}
 
 	if *verbose {
-		log.Printf("Received client pre-login (%d bytes)", len(clientPreLogin))
+		log.Printf("[%s] Received client pre-login (%d bytes)", tag, len(clientPreLogin))
 	}
 
 	// Forward client pre-login to server UNMODIFIED (server needs to see encryption support)
 	if _, err := rawRemote.Write(clientPreLogin); err != nil {
-		log.Printf("Failed to send pre-login to server: %v", err)
+		log.Printf("[%s] Failed to send pre-login to server: %v", tag, err)
 		return
 	}
 
 	// Read server's pre-login response
-	serverPreLogin, err := readTDSPacket(rawRemote, "server-prelogin")
+	serverPreLogin, err := readTDSPacket(rawRemote, tag+"/server-prelogin")
 	if err != nil {
-		log.Printf("Failed to read server pre-login: %v", err)
+		log.Printf("[%s] Failed to read server pre-login: %v", tag, err)
 		return
 	}
 
 	if *verbose {
-		log.Printf("Received server pre-login response (%d bytes)", len(serverPreLogin))
+		log.Printf("[%s] Received server pre-login response (%d bytes)", tag, len(serverPreLogin))
 	}
 
 	// Check server's encryption preference and establish TLS if needed
@@ -113,7 +116,7 @@ func handleConnection(clientConn net.Conn) {
 
 	if serverEncrypt != 0x02 { // Anything other than ENCRYPT_NOT_SUP
 		if *verbose {
-			log.Printf("Server encryption=0x%02x, performing TLS handshake", serverEncrypt)
+			log.Printf("[%s] Server encryption=0x%02x, performing TLS handshake", tag, serverEncrypt)
 		}
 
 		hsConn := &tdsHandshakeConn{conn: rawRemote}
@@ -121,63 +124,64 @@ func handleConnection(clientConn net.Conn) {
 			InsecureSkipVerify: true,
 		})
 		if err := tlsConn.Handshake(); err != nil {
-			log.Printf("TLS handshake with server failed: %v", err)
+			log.Printf("[%s] TLS handshake with server failed: %v", tag, err)
 			return
 		}
 		hsConn.passthrough = true
 		serverConn = tlsConn
-		log.Printf("TLS established with server")
+		log.Printf("[%s] TLS established with server", tag)
 	}
 
 	// Tell client encryption is not supported so it stays plaintext with us
 	disableEncryption(serverPreLogin)
 	if _, err := clientConn.Write(serverPreLogin); err != nil {
-		log.Printf("Failed to send pre-login to client: %v", err)
+		log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
 		return
 	}
 
 	// Phase 2: Read client's login packet to extract credentials (plaintext)
-	loginPacket, err := readTDSPacket(clientConn, "client-login")
+	loginPacket, err := readTDSPacket(clientConn, tag+"/client-login")
 	if err != nil {
-		log.Printf("Failed to read client login: %v", err)
+		log.Printf("[%s] Failed to read client login: %v", tag, err)
 		return
 	}
 
 	credentials, err := parseLoginPacket(loginPacket)
 	if err != nil {
-		log.Printf("Failed to parse login packet: %v", err)
+		log.Printf("[%s] Failed to parse login packet: %v", tag, err)
 		return
 	}
 
-	log.Printf("Received credentials: %s\\%s", credentials.Domain, credentials.Username)
+	log.Printf("[%s] Received credentials: %s\\%s", tag, credentials.Domain, credentials.Username)
 
 	// Phase 3: Perform NTLM authentication with remote server (over TLS if applicable)
-	authResponse, err := performNTLMAuth(serverConn, credentials)
+	authResponse, err := performNTLMAuth(serverConn, credentials, tag)
 	if err != nil {
-		log.Printf("NTLM authentication failed: %v", err)
+		log.Printf("[%s] NTLM authentication failed: %v", tag, err)
 		return
 	}
 
-	log.Printf("NTLM authentication successful for %s\\%s", credentials.Domain, credentials.Username)
+	log.Printf("[%s] NTLM authentication successful for %s\\%s", tag, credentials.Domain, credentials.Username)
 
 	// Phase 4: Forward the server's real login response to the client
 	// (contains correct TDS version, env changes, collation, etc.)
 	if _, err := clientConn.Write(authResponse); err != nil {
-		log.Printf("Failed to forward login response to client: %v", err)
+		log.Printf("[%s] Failed to forward login response to client: %v", tag, err)
 		return
 	}
 
 	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
-	log.Printf("Starting bidirectional relay")
+	log.Printf("[%s] Starting bidirectional relay", tag)
 	done := make(chan struct{})
 	go func() {
-		relay(clientConn, serverConn, "server->client")
+		relay(clientConn, serverConn, tag+"/server->client")
 		clientConn.Close()
 		close(done)
 	}()
-	relay(serverConn, clientConn, "client->server")
+	relay(serverConn, clientConn, tag+"/client->server")
 	serverConn.Close()
 	<-done
+	log.Printf("[%s] Connection closed", tag)
 }
 
 type Credentials struct {
@@ -435,7 +439,7 @@ func readTDSPacket(conn net.Conn, label string) ([]byte, error) {
 
 // performNTLMAuth performs NTLM authentication with the server and returns
 // the server's final auth response (LOGINACK + env changes) to forward to the client.
-func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
+func performNTLMAuth(conn net.Conn, creds *Credentials, tag string) ([]byte, error) {
 	// Send NTLM Type 1 (Negotiate)
 	negotiate, err := ntlmssp.NewNegotiateMessage(creds.Domain, "")
 	if err != nil {
@@ -449,11 +453,11 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
 	}
 
 	if *verbose {
-		log.Printf("Sent NTLM Type 1 (%d bytes)", len(negotiate))
+		log.Printf("[%s] Sent NTLM Type 1 (%d bytes)", tag, len(negotiate))
 	}
 
 	// Read NTLM Type 2 (Challenge) from server
-	type2Packet, err := readTDSPacket(conn, "server-ntlm-type2")
+	type2Packet, err := readTDSPacket(conn, tag+"/server-ntlm-type2")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read challenge: %w", err)
 	}
@@ -465,7 +469,7 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
 	}
 
 	if *verbose {
-		log.Printf("Received NTLM Type 2 (%d bytes)", len(type2Msg))
+		log.Printf("[%s] Received NTLM Type 2 (%d bytes)", tag, len(type2Msg))
 	}
 
 	// Create NTLM Type 3 (Authenticate)
@@ -481,14 +485,14 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
 	}
 
 	if *verbose {
-		log.Printf("Sent NTLM Type 3 (%d bytes)", len(authenticate))
+		log.Printf("[%s] Sent NTLM Type 3 (%d bytes)", tag, len(authenticate))
 	}
 
 	// Read ALL packets of the server's auth response until EOM
 	// (LOGINACK + env changes + DONE may span multiple TDS packets)
 	var fullResponse []byte
 	for {
-		packet, err := readTDSPacket(conn, "server-auth-response")
+		packet, err := readTDSPacket(conn, tag+"/server-auth-response")
 		if err != nil {
 			return nil, fmt.Errorf("failed to read auth response: %w", err)
 		}
@@ -507,7 +511,7 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
 	}
 
 	if *verbose {
-		log.Printf("Auth response: %d bytes total", len(fullResponse))
+		log.Printf("[%s] Auth response: %d bytes total", tag, len(fullResponse))
 	}
 
 	return fullResponse, nil
@@ -701,6 +705,12 @@ func introspectTokens(direction string, data []byte) {
 		pos++
 
 		switch {
+		case token == 0x81: // COLMETADATA - complex variable-length, can't parse without full spec
+			log.Printf("%s:     token %s (remaining %d bytes unparsed)", direction, name, len(data)-pos)
+			return
+		case token == 0xD1, token == 0xD3: // ROW / NBCROW - depends on COLMETADATA column defs
+			log.Printf("%s:     token %s (remaining %d bytes unparsed)", direction, name, len(data)-pos)
+			return
 		case token == 0xAA: // ERROR token
 			if pos+2 > len(data) {
 				return
