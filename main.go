@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -167,33 +166,6 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("Failed to forward login response to client: %v", err)
 		return
 	}
-
-	// Drain any additional server messages from the login exchange
-	// (some servers send extra env changes, info messages after the first EOM)
-	for {
-		serverConn.SetReadDeadline(time.Now().Add(time.Second))
-		header := make([]byte, 8)
-		if _, err := io.ReadFull(serverConn, header); err != nil {
-			break // timeout or error = server done sending
-		}
-		length := int(binary.BigEndian.Uint16(header[2:4]))
-		if length < 8 {
-			break
-		}
-		packet := make([]byte, length)
-		copy(packet, header)
-		if _, err := io.ReadFull(serverConn, packet[8:]); err != nil {
-			break
-		}
-		if *verbose {
-			log.Printf("Forwarding post-login packet: type=0x%02x, %d bytes", packet[0], length)
-		}
-		if _, err := clientConn.Write(packet); err != nil {
-			log.Printf("Failed to forward post-login data: %v", err)
-			return
-		}
-	}
-	serverConn.SetReadDeadline(time.Time{}) // clear deadline before relay
 
 	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
 	log.Printf("Starting bidirectional relay")
@@ -644,30 +616,63 @@ func extractSSPI(packet []byte) ([]byte, error) {
 	return nil, fmt.Errorf("no SSPI data found in packet")
 }
 
-func isClosedErr(err error) bool {
-	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
-}
-
 func relay(dst, src net.Conn, direction string) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
 		if err != nil {
-			if err != io.EOF && !isClosedErr(err) && *verbose {
-				log.Printf("%s relay error: %v", direction, err)
+			if err != io.EOF {
+				log.Printf("%s read error: %v", direction, err)
+			} else if *verbose {
+				log.Printf("%s: EOF", direction)
 			}
 			return
+		}
+
+		if *verbose && n >= 8 {
+			pktType := buf[0]
+			pktStatus := buf[1]
+			pktLen := binary.BigEndian.Uint16(buf[2:4])
+			typeName := tdsPacketTypeName(pktType)
+			log.Printf("%s: %d bytes [type=0x%02x(%s) status=0x%02x len=%d]",
+				direction, n, pktType, typeName, pktStatus, pktLen)
+			if pktType == 0x04 && n > 8 { // Tabular result - log first token
+				log.Printf("%s:   first token=0x%02x", direction, buf[8])
+			}
+		} else if *verbose {
+			log.Printf("%s: %d bytes (fragment)", direction, n)
 		}
 
 		if _, err := dst.Write(buf[:n]); err != nil {
-			if !isClosedErr(err) && *verbose {
-				log.Printf("%s write error: %v", direction, err)
-			}
+			log.Printf("%s write error: %v", direction, err)
 			return
 		}
+	}
+}
 
-		if *verbose {
-			log.Printf("%s: relayed %d bytes", direction, n)
-		}
+func tdsPacketTypeName(t byte) string {
+	switch t {
+	case 0x01:
+		return "SQLBatch"
+	case 0x02:
+		return "PreTDS7Login"
+	case 0x03:
+		return "RPC"
+	case 0x04:
+		return "TabularResult"
+	case 0x06:
+		return "Attention"
+	case 0x07:
+		return "BulkLoad"
+	case 0x0E:
+		return "TransMgr"
+	case 0x10:
+		return "Login7"
+	case 0x11:
+		return "SSPI"
+	case 0x12:
+		return "PreLogin"
+	default:
+		return "Unknown"
 	}
 }
