@@ -819,6 +819,16 @@ func introspectRead(direction string, data []byte) {
 		log.Printf("%s:   pkt#%d @%d: type=0x%02x(%s) status=0x%02x(%s) len=%d",
 			direction, pktNum, offset, pktType, typeName, pktStatus, statusFlags, pktLen)
 
+		// Dump hex of packets with RESETCONN flag to see what's inside
+		if pktStatus&0x04 != 0 || pktStatus&0x08 != 0 {
+			end := offset + pktLen
+			if end > len(data) {
+				end = len(data)
+			}
+			payload := data[offset:end]
+			log.Printf("%s:   RESETCONN packet hex: %s", direction, hex.EncodeToString(payload))
+		}
+
 		// Introspect tokens in TabularResult packets
 		if pktType == 0x04 {
 			end := offset + pktLen
@@ -828,6 +838,16 @@ func introspectRead(direction string, data []byte) {
 			if offset+8 < end {
 				introspectTokens(direction, data[offset+8:end])
 			}
+		}
+
+		// Dump RPC packets (type 0x03) to see stored procedure calls
+		if pktType == 0x03 {
+			end := offset + pktLen
+			if end > len(data) {
+				end = len(data)
+			}
+			payload := data[offset+8 : end] // skip TDS header
+			log.Printf("%s:   RPC payload hex: %s", direction, hex.EncodeToString(payload))
 		}
 
 		if pktLen < 8 {
