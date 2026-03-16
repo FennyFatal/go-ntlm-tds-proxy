@@ -549,6 +549,13 @@ func performNTLMAuth(conn net.Conn, creds *Credentials, fields *LoginFields, tag
 		return nil, fmt.Errorf("failed to read challenge: %w", err)
 	}
 
+	// Check if server returned an error instead of SSPI challenge
+	if len(type2Packet) >= 8 && type2Packet[0] == 0x04 {
+		// Server returned TabularResult - likely an error
+		log.Printf("[%s] Server returned error instead of NTLM challenge: %s", tag, hex.EncodeToString(type2Packet))
+		return nil, fmt.Errorf("server rejected NTLM login (packet type 0x%02x)", type2Packet[0])
+	}
+
 	// Extract Type 2 message from the packet
 	type2Msg, err := extractSSPI(type2Packet)
 	if err != nil {
