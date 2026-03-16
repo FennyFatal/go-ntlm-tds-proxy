@@ -218,6 +218,7 @@ type LoginFields struct {
 	CltIntName     []byte
 	Language       []byte
 	Database       []byte
+	ClientID       []byte // 6 bytes: MAC address / client identifier (offset 72-77)
 }
 
 func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
@@ -309,6 +310,12 @@ func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
 	fields.CltIntName, _ = readRawField(60, 62)
 	fields.Language, _ = readRawField(64, 66)
 	fields.Database, _ = readRawField(68, 70)
+
+	// ClientID is a fixed 6-byte field at offset 72-77 (not offset/length pair)
+	if len(loginData) >= 78 {
+		fields.ClientID = make([]byte, 6)
+		copy(fields.ClientID, loginData[72:78])
+	}
 
 	return &Credentials{
 		Domain:   domain,
@@ -549,13 +556,6 @@ func performNTLMAuth(conn net.Conn, creds *Credentials, fields *LoginFields, tag
 		return nil, fmt.Errorf("failed to read challenge: %w", err)
 	}
 
-	// Check if server returned an error instead of SSPI challenge
-	if len(type2Packet) >= 8 && type2Packet[0] == 0x04 {
-		// Server returned TabularResult - likely an error
-		log.Printf("[%s] Server returned error instead of NTLM challenge: %s", tag, hex.EncodeToString(type2Packet))
-		return nil, fmt.Errorf("server rejected NTLM login (packet type 0x%02x)", type2Packet[0])
-	}
-
 	// Extract Type 2 message from the packet
 	type2Msg, err := extractSSPI(type2Packet)
 	if err != nil {
@@ -628,8 +628,12 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	}
 
 	if *verbose {
-		log.Printf("Building NTLM LOGIN7: TDSVersion=0x%08x majorVersion=0x%02x fixedSize=%d OptionFlags3=0x%02x",
-			fields.TDSVersion, majorVersion, fixedSize, fields.OptionFlags3)
+		clientIDHex := "nil"
+		if len(fields.ClientID) == 6 {
+			clientIDHex = hex.EncodeToString(fields.ClientID)
+		}
+		log.Printf("Building NTLM LOGIN7: TDSVersion=0x%08x majorVersion=0x%02x fixedSize=%d OptionFlags3=0x%02x ClientID=%s",
+			fields.TDSVersion, majorVersion, fixedSize, fields.OptionFlags3, clientIDHex)
 	}
 
 	login := make([]byte, fixedSize)
@@ -684,6 +688,11 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	writeField(64, fields.Language)      // ibLanguage=64, cchLanguage=66
 	writeField(68, fields.Database)      // ibDatabase=68, cchDatabase=70
 
+	// ClientID at offset 72-77 (6-byte fixed field: MAC address / client identifier)
+	if len(fields.ClientID) == 6 {
+		copy(login[72:78], fields.ClientID)
+	}
+
 	// SSPI offset and length (ibSSPI at 78, cbSSPI at 80)
 	sspiOff := fixedSize + len(varData)
 	binary.LittleEndian.PutUint16(login[78:80], uint16(sspiOff))
@@ -694,12 +703,12 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	emptyOff := fixedSize + len(varData)
 	binary.LittleEndian.PutUint16(login[82:84], uint16(emptyOff)) // ibAtchDBFile=82
 	binary.LittleEndian.PutUint16(login[84:86], 0)
-	binary.LittleEndian.PutUint16(login[86:88], uint16(emptyOff)) // ibChangePassword=86
-	binary.LittleEndian.PutUint16(login[88:90], 0)
 
-	// cbSSPILong at offset 90 (TDS 7.2+ only, used when cbSSPI=0xFFFF; 0 otherwise)
+	// ibChangePassword/cchChangePassword and cbSSPILong only exist for TDS 7.2+
 	if fixedSize >= 94 {
-		binary.LittleEndian.PutUint32(login[90:94], 0)
+		binary.LittleEndian.PutUint16(login[86:88], uint16(emptyOff)) // ibChangePassword=86
+		binary.LittleEndian.PutUint16(login[88:90], 0)
+		binary.LittleEndian.PutUint32(login[90:94], 0) // cbSSPILong
 	}
 
 	// Append variable data to login record
@@ -736,10 +745,8 @@ func extractSSPI(packet []byte) ([]byte, error) {
 	// Skip TDS header
 	data := packet[8:]
 
-	// Check packet type - server login response is Tabular Result (0x04)
-	if packet[0] != 0x04 {
-		return nil, fmt.Errorf("unexpected packet type 0x%02x, expected 0x04", packet[0])
-	}
+	// Server sends TabularResult (0x04) for SSPI challenge - this is correct
+	// No need to validate packet type here
 
 	// Parse TDS tokens to find SSPI (0xED)
 	pos := 0
