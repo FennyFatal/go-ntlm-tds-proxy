@@ -152,16 +152,18 @@ func handleConnection(clientConn net.Conn) {
 	log.Printf("Received credentials: %s\\%s", credentials.Domain, credentials.Username)
 
 	// Phase 3: Perform NTLM authentication with remote server (over TLS if applicable)
-	if err := performNTLMAuth(serverConn, credentials); err != nil {
+	authResponse, err := performNTLMAuth(serverConn, credentials)
+	if err != nil {
 		log.Printf("NTLM authentication failed: %v", err)
 		return
 	}
 
 	log.Printf("NTLM authentication successful for %s\\%s", credentials.Domain, credentials.Username)
 
-	// Phase 4: Send login success to client
-	if err := sendLoginAck(clientConn); err != nil {
-		log.Printf("Failed to send login ack: %v", err)
+	// Phase 4: Forward the server's real login response to the client
+	// (contains correct TDS version, env changes, collation, etc.)
+	if _, err := clientConn.Write(authResponse); err != nil {
+		log.Printf("Failed to forward login response to client: %v", err)
 		return
 	}
 
@@ -424,17 +426,19 @@ func readTDSPacket(conn net.Conn, label string) ([]byte, error) {
 	return packet, nil
 }
 
-func performNTLMAuth(conn net.Conn, creds *Credentials) error {
+// performNTLMAuth performs NTLM authentication with the server and returns
+// the server's final auth response (LOGINACK + env changes) to forward to the client.
+func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
 	// Send NTLM Type 1 (Negotiate)
 	negotiate, err := ntlmssp.NewNegotiateMessage(creds.Domain, "")
 	if err != nil {
-		return fmt.Errorf("failed to create negotiate message: %w", err)
+		return nil, fmt.Errorf("failed to create negotiate message: %w", err)
 	}
 
 	// Build TDS login packet with NTLM Type 1
 	loginWithNTLM1 := buildNTLMLoginPacket(negotiate)
 	if _, err := conn.Write(loginWithNTLM1); err != nil {
-		return fmt.Errorf("failed to send negotiate: %w", err)
+		return nil, fmt.Errorf("failed to send negotiate: %w", err)
 	}
 
 	if *verbose {
@@ -444,13 +448,13 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 	// Read NTLM Type 2 (Challenge) from server
 	type2Packet, err := readTDSPacket(conn, "server-ntlm-type2")
 	if err != nil {
-		return fmt.Errorf("failed to read challenge: %w", err)
+		return nil, fmt.Errorf("failed to read challenge: %w", err)
 	}
 
 	// Extract Type 2 message from the packet
 	type2Msg, err := extractSSPI(type2Packet)
 	if err != nil {
-		return fmt.Errorf("failed to extract challenge: %w", err)
+		return nil, fmt.Errorf("failed to extract challenge: %w", err)
 	}
 
 	if *verbose {
@@ -460,31 +464,31 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 	// Create NTLM Type 3 (Authenticate)
 	authenticate, err := ntlmssp.ProcessChallenge(type2Msg, creds.Username, creds.Password, true)
 	if err != nil {
-		return fmt.Errorf("failed to process challenge: %w", err)
+		return nil, fmt.Errorf("failed to process challenge: %w", err)
 	}
 
 	// Send NTLM Type 3 as SSPI message (type 0x11, not LOGIN7)
 	sspiPacket := buildSSPIPacket(authenticate)
 	if _, err := conn.Write(sspiPacket); err != nil {
-		return fmt.Errorf("failed to send authenticate: %w", err)
+		return nil, fmt.Errorf("failed to send authenticate: %w", err)
 	}
 
 	if *verbose {
 		log.Printf("Sent NTLM Type 3 (%d bytes)", len(authenticate))
 	}
 
-	// Read the response
+	// Read the server's auth response (LOGINACK + env changes + DONE)
 	response, err := readTDSPacket(conn, "server-auth-response")
 	if err != nil {
-		return fmt.Errorf("failed to read auth response: %w", err)
+		return nil, fmt.Errorf("failed to read auth response: %w", err)
 	}
 
-	// Check if it's a login ack (type 0x04) or error (0x02)
-	if response[0] == 0x02 {
-		return fmt.Errorf("authentication rejected by server")
+	// Check if it's a tabular result (0x04) or error
+	if response[0] != 0x04 {
+		return nil, fmt.Errorf("authentication rejected by server (packet type 0x%02x)", response[0])
 	}
 
-	return nil
+	return response, nil
 }
 
 func buildNTLMLoginPacket(sspi []byte) []byte {
@@ -588,56 +592,6 @@ func extractSSPI(packet []byte) ([]byte, error) {
 	}
 
 	return nil, fmt.Errorf("no SSPI data found in packet")
-}
-
-func sendLoginAck(conn net.Conn) error {
-	// Build TDS response body with LOGINACK + DONE tokens
-	var body []byte
-
-	// LOGINACK token (0xAD)
-	ackData := []byte{
-		0x01,                   // Interface: SQL_TSQL
-		0x71, 0x00, 0x00, 0x01, // TDS Version 7.1
-	}
-	// Program name "Relay" as length-prefixed UTF-16LE
-	progName := utf16LEEncode("Relay")
-	ackData = append(ackData, byte(len(progName)/2)) // length in chars
-	ackData = append(ackData, progName...)
-	// Program version (major.minor.buildHi.buildLo)
-	ackData = append(ackData, 0x01, 0x00, 0x00, 0x00)
-
-	body = append(body, 0xAD) // LOGINACK token type
-	lenBytes := make([]byte, 2)
-	binary.LittleEndian.PutUint16(lenBytes, uint16(len(ackData)))
-	body = append(body, lenBytes...)
-	body = append(body, ackData...)
-
-	// DONE token (0xFD)
-	body = append(body,
-		0xFD,
-		0x00, 0x00, // Status: DONE_FINAL
-		0x00, 0x00, // CurCmd
-		0x00, 0x00, 0x00, 0x00, // DoneRowCount (4 bytes for TDS 7.1)
-	)
-
-	// Build TDS packet header
-	packet := make([]byte, 8)
-	packet[0] = 0x04 // Type: Tabular Result
-	packet[1] = 0x01 // Status: End of message
-	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(body)))
-
-	packet = append(packet, body...)
-	_, err := conn.Write(packet)
-	return err
-}
-
-func utf16LEEncode(s string) []byte {
-	runes := utf16.Encode([]rune(s))
-	b := make([]byte, len(runes)*2)
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(b[i*2:], r)
-	}
-	return b
 }
 
 func relay(dst, src net.Conn, direction string) {
