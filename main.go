@@ -168,6 +168,33 @@ func handleConnection(clientConn net.Conn) {
 		return
 	}
 
+	// Drain any additional server messages from the login exchange
+	// (some servers send extra env changes, info messages after the first EOM)
+	for {
+		serverConn.SetReadDeadline(time.Now().Add(time.Second))
+		header := make([]byte, 8)
+		if _, err := io.ReadFull(serverConn, header); err != nil {
+			break // timeout or error = server done sending
+		}
+		length := int(binary.BigEndian.Uint16(header[2:4]))
+		if length < 8 {
+			break
+		}
+		packet := make([]byte, length)
+		copy(packet, header)
+		if _, err := io.ReadFull(serverConn, packet[8:]); err != nil {
+			break
+		}
+		if *verbose {
+			log.Printf("Forwarding post-login packet: type=0x%02x, %d bytes", packet[0], length)
+		}
+		if _, err := clientConn.Write(packet); err != nil {
+			log.Printf("Failed to forward post-login data: %v", err)
+			return
+		}
+	}
+	serverConn.SetReadDeadline(time.Time{}) // clear deadline before relay
+
 	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
 	log.Printf("Starting bidirectional relay")
 	done := make(chan struct{})
