@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"github.com/Azure/go-ntlmssp" // Cross-platform NTLM including Mac
@@ -48,7 +50,8 @@ func main() {
 func handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	remoteConn, err := net.Dial("tcp", *remoteAddr)
+	log.Printf("Dialing remote %s...", *remoteAddr)
+	remoteConn, err := net.DialTimeout("tcp", *remoteAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("Failed to connect to remote %s: %v", *remoteAddr, err)
 		return
@@ -60,7 +63,7 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	// Phase 1: Handle pre-login with both sides
-	clientPreLogin, err := readTDSPacket(clientConn)
+	clientPreLogin, err := readTDSPacket(clientConn, "client-prelogin")
 	if err != nil {
 		log.Printf("Failed to read client pre-login: %v", err)
 		return
@@ -80,7 +83,7 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	// Read server's pre-login response
-	serverPreLogin, err := readTDSPacket(remoteConn)
+	serverPreLogin, err := readTDSPacket(remoteConn, "server-prelogin")
 	if err != nil {
 		log.Printf("Failed to read server pre-login: %v", err)
 		return
@@ -100,7 +103,7 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	// Phase 2: Read client's login packet to extract credentials
-	loginPacket, err := readTDSPacket(clientConn)
+	loginPacket, err := readTDSPacket(clientConn, "client-login")
 	if err != nil {
 		log.Printf("Failed to read client login: %v", err)
 		return
@@ -252,14 +255,30 @@ func disableEncryption(packet []byte) {
 	}
 }
 
-func readTDSPacket(conn net.Conn) ([]byte, error) {
-	header := make([]byte, 8)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
+func readTDSPacket(conn net.Conn, label string) ([]byte, error) {
+	if *verbose {
+		log.Printf("[%s] waiting for TDS packet...", label)
 	}
 
-	// TDS packet length is at offset 2-3 (big endian)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, fmt.Errorf("reading header: %w", err)
+	}
+
+	pktType := header[0]
 	length := int(binary.BigEndian.Uint16(header[2:4]))
+
+	if *verbose {
+		log.Printf("[%s] header: type=0x%02x status=0x%02x length=%d", label, pktType, header[1], length)
+		log.Printf("[%s] raw header: %s", label, hex.EncodeToString(header))
+	}
+
+	if length < 8 {
+		return nil, fmt.Errorf("invalid TDS packet length %d (< 8)", length)
+	}
 
 	// Allocate full packet
 	packet := make([]byte, length)
@@ -267,7 +286,11 @@ func readTDSPacket(conn net.Conn) ([]byte, error) {
 
 	// Read remaining data
 	if _, err := io.ReadFull(conn, packet[8:]); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading body (%d bytes): %w", length-8, err)
+	}
+
+	if *verbose {
+		log.Printf("[%s] read complete: %d bytes total", label, length)
 	}
 
 	return packet, nil
@@ -291,7 +314,7 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 	}
 
 	// Read NTLM Type 2 (Challenge) from server
-	type2Packet, err := readTDSPacket(conn)
+	type2Packet, err := readTDSPacket(conn, "server-ntlm-type2")
 	if err != nil {
 		return fmt.Errorf("failed to read challenge: %w", err)
 	}
@@ -323,7 +346,7 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 	}
 
 	// Read the response
-	response, err := readTDSPacket(conn)
+	response, err := readTDSPacket(conn, "server-auth-response")
 	if err != nil {
 		return fmt.Errorf("failed to read auth response: %w", err)
 	}
