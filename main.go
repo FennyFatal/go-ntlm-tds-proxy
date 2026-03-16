@@ -619,6 +619,11 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 		fixedSize = 86
 	}
 
+	if *verbose {
+		log.Printf("Building NTLM LOGIN7: TDSVersion=0x%08x majorVersion=0x%02x fixedSize=%d OptionFlags3=0x%02x",
+			fields.TDSVersion, majorVersion, fixedSize, fields.OptionFlags3)
+	}
+
 	login := make([]byte, fixedSize)
 
 	// TDS Version at offset 4 — forward client's requested version
@@ -640,7 +645,7 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	login[24] = fields.OptionFlags1
 	login[25] = fields.OptionFlags2 | 0x80 // add fIntSecurity for NTLM
 	login[26] = fields.TypeFlags
-	login[27] = fields.OptionFlags3 &^ 0x02 // clear fExtension bit since we don't forward FEATUREEXT
+	login[27] = fields.OptionFlags3 // forward as-is for now
 
 	// Client timezone and collation LCID
 	binary.LittleEndian.PutUint32(login[28:32], fields.ClientTimeZone)
