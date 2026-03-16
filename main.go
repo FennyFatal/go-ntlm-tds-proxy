@@ -563,9 +563,14 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	// client version, PID, connection ID, all option/type flags, timezone, LCID
 	copy(login[0:36], fields.FixedPrefix)
 
-	// Set fIntSecurity (0x80) in OptionFlags2 while preserving client's other flags
-	// (e.g. fODBC=0x02 which affects quoted identifier and ANSI null behavior)
+	// Fix up flags for NTLM auth:
+	// - Clear ConnectionID (offset 20-23): we're making a new connection, not reconnecting
+	binary.LittleEndian.PutUint32(login[20:24], 0)
+	// - Set fIntSecurity (0x80) in OptionFlags2 while preserving client's other flags
+	//   (e.g. fODBC=0x02 which affects quoted identifier and ANSI null behavior)
 	login[25] |= 0x80
+	// - Clear fExtension (0x10) in OptionFlags3: we don't forward the FEATUREEXT block
+	login[27] &^= 0x10
 
 	// Build variable data area with client's fields
 	// Order: HostName, UserName(empty), Password(empty), AppName, ServerName,
