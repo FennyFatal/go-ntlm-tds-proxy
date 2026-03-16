@@ -463,9 +463,9 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 		return fmt.Errorf("failed to process challenge: %w", err)
 	}
 
-	// Send NTLM Type 3
-	loginWithNTLM3 := buildNTLMLoginPacket(authenticate)
-	if _, err := conn.Write(loginWithNTLM3); err != nil {
+	// Send NTLM Type 3 as SSPI message (type 0x11, not LOGIN7)
+	sspiPacket := buildSSPIPacket(authenticate)
+	if _, err := conn.Write(sspiPacket); err != nil {
 		return fmt.Errorf("failed to send authenticate: %w", err)
 	}
 
@@ -488,19 +488,30 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 }
 
 func buildNTLMLoginPacket(sspi []byte) []byte {
-	// Build a minimal TDS LOGIN7 packet with SSPI data
+	// Build a TDS LOGIN7 packet with SSPI data for NTLM Type 1 (Negotiate)
 	const fixedSize = 86
 
-	// Build login7 structure
 	login := make([]byte, fixedSize)
 
-	// TDS Version at offset 4 (TDS 7.1)
-	binary.LittleEndian.PutUint32(login[4:8], 0x71000001)
+	// TDS Version at offset 4 (TDS 7.4)
+	binary.LittleEndian.PutUint32(login[4:8], 0x74000004)
+
+	// PacketSize at offset 8
+	binary.LittleEndian.PutUint32(login[8:12], 4096)
 
 	// OptionFlags2 at offset 25: set fIntSecurity (0x80) for NTLM/SSPI
 	login[25] = 0x80
 
-	// Set SSPI offset and length (ibSSPI at 78, cbSSPI at 80)
+	// Point all variable-length field offsets to the start of the variable data
+	// area (right after the fixed header). All lengths are 0 (empty fields).
+	// Offsets: ibHostName=36, ibUserName=40, ibPassword=44, ibAppName=48,
+	//          ibServerName=52, ibExtension=56, ibCltIntName=60,
+	//          ibLanguage=64, ibDatabase=68, ibAtchDBFile=82
+	for _, off := range []int{36, 40, 44, 48, 52, 56, 60, 64, 68, 82} {
+		binary.LittleEndian.PutUint16(login[off:off+2], uint16(fixedSize))
+	}
+
+	// SSPI offset and length (ibSSPI at 78, cbSSPI at 80)
 	binary.LittleEndian.PutUint16(login[78:80], uint16(fixedSize))
 	binary.LittleEndian.PutUint16(login[80:82], uint16(len(sspi)))
 
@@ -517,6 +528,17 @@ func buildNTLMLoginPacket(sspi []byte) []byte {
 	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(login)))
 
 	return append(packet, login...)
+}
+
+// buildSSPIPacket wraps an NTLM Type 3 (Authenticate) message in a TDS SSPI
+// packet (type 0x11). This is distinct from the LOGIN7 used for Type 1.
+func buildSSPIPacket(sspi []byte) []byte {
+	packet := make([]byte, 8+len(sspi))
+	packet[0] = 0x11 // Type: SSPI Message
+	packet[1] = 0x01 // Status: End of message
+	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(sspi)))
+	copy(packet[8:], sspi)
+	return packet
 }
 
 func extractSSPI(packet []byte) ([]byte, error) {
