@@ -637,10 +637,9 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	binary.LittleEndian.PutUint32(login[8:12], pktSize)
 
 	// Forward additional client fields
-	// NOTE: Temporarily zeroing these to test if they're causing issues
-	binary.LittleEndian.PutUint32(login[12:16], 0) // fields.ClientProgVer
-	binary.LittleEndian.PutUint32(login[16:20], 0) // fields.ClientPID
-	binary.LittleEndian.PutUint32(login[20:24], 0) // fields.ConnectionID
+	binary.LittleEndian.PutUint32(login[12:16], fields.ClientProgVer)
+	binary.LittleEndian.PutUint32(login[16:20], fields.ClientPID)
+	binary.LittleEndian.PutUint32(login[20:24], fields.ConnectionID)
 
 	// Option/type flags — forward client's values for correct SET behavior
 	login[24] = fields.OptionFlags1
