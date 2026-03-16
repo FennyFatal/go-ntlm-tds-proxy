@@ -93,9 +93,8 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("[%s] Received client pre-login (%d bytes)", tag, len(clientPreLogin))
 	}
 
-	// Disable MARS in client's PRELOGIN before forwarding to server.
-	// MARS causes SMUX framing issues in the relay.
-	disableMARS(clientPreLogin)
+	// Forward client's PRELOGIN to server as-is (MARS negotiation left intact)
+	// disableMARS(clientPreLogin)
 
 	if _, err := rawRemote.Write(clientPreLogin); err != nil {
 		log.Printf("[%s] Failed to send pre-login to server: %v", tag, err)
@@ -135,10 +134,10 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("[%s] TLS established with server", tag)
 	}
 
-	// Tell client encryption and MARS are not supported so it stays plaintext
-	// and doesn't expect SMUX framing
+	// Tell client encryption is not supported so it stays plaintext
+	// (MARS negotiation left intact)
 	disableEncryption(serverPreLogin)
-	disableMARS(serverPreLogin)
+	// disableMARS(serverPreLogin)
 	if _, err := clientConn.Write(serverPreLogin); err != nil {
 		log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
 		return
@@ -160,7 +159,7 @@ func handleConnection(clientConn net.Conn) {
 	log.Printf("[%s] Received credentials: %s\\%s (database=%q)", tag, credentials.Domain, credentials.Username, decodeUTF16LE(loginFields.Database))
 
 	// Phase 3: Perform NTLM authentication with remote server (over TLS if applicable)
-	authResponse, err := performNTLMAuth(serverConn, credentials, loginFields, tag)
+	authResponse, err := performNTLMAuth(serverConn, credentials, loginPacket, tag)
 	if err != nil {
 		log.Printf("[%s] NTLM authentication failed: %v", tag, err)
 		return
@@ -533,15 +532,15 @@ func readTDSPacket(conn net.Conn, label string) ([]byte, error) {
 
 // performNTLMAuth performs NTLM authentication with the server and returns
 // the server's final auth response (LOGINACK + env changes) to forward to the client.
-func performNTLMAuth(conn net.Conn, creds *Credentials, fields *LoginFields, tag string) ([]byte, error) {
+func performNTLMAuth(conn net.Conn, creds *Credentials, originalLogin []byte, tag string) ([]byte, error) {
 	// Send NTLM Type 1 (Negotiate)
 	negotiate, err := ntlmssp.NewNegotiateMessage(creds.Domain, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create negotiate message: %w", err)
 	}
 
-	// Build TDS login packet with NTLM Type 1, forwarding client's LOGIN7 fields
-	loginWithNTLM1 := buildNTLMLoginPacket(negotiate, fields)
+	// Build TDS login packet by modifying client's original LOGIN7 for NTLM
+	loginWithNTLM1 := buildNTLMLoginPacket(originalLogin, negotiate)
 	if _, err := conn.Write(loginWithNTLM1); err != nil {
 		return nil, fmt.Errorf("failed to send negotiate: %w", err)
 	}
@@ -611,110 +610,49 @@ func performNTLMAuth(conn net.Conn, creds *Credentials, fields *LoginFields, tag
 	return fullResponse, nil
 }
 
-func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
-	// Build a TDS LOGIN7 packet with SSPI data for NTLM Type 1 (Negotiate)
-	// Header size depends on TDS version:
-	// - TDS 7.0/7.1: 86 bytes (base header)
-	// - TDS 7.2+: 94 bytes (includes cbSSPILong at offset 90)
+func buildNTLMLoginPacket(originalPacket []byte, sspi []byte) []byte {
+	// Modify the client's original LOGIN7 packet in-place for NTLM auth
+	// Skip TDS header (8 bytes), work with LOGIN7 data
+	original := originalPacket[8:]
+	login := make([]byte, len(original))
+	copy(login, original)
 
-	// Extract major version from TDS version field (high byte)
-	majorVersion := (fields.TDSVersion >> 24) & 0xFF
+	// Get original length and find where variable data ends
+	origLen := binary.LittleEndian.Uint32(login[0:4])
 
-	var fixedSize int
-	if majorVersion >= 0x72 { // TDS 7.2+
-		fixedSize = 94
-	} else { // TDS 7.0/7.1
-		fixedSize = 86
-	}
+	// Modify OptionFlags2 to add fIntSecurity (0x80) for NTLM
+	login[25] |= 0x80
 
-	if *verbose {
-		clientIDHex := "nil"
-		if len(fields.ClientID) == 6 {
-			clientIDHex = hex.EncodeToString(fields.ClientID)
+	// Modify OptionFlags3: clear fExtension (0x02) and fUserInstance (0x10)
+	// Keep fSparseColumnSort (0x04) if set
+	login[27] &= 0x04
+
+	// Clear username offset/length (offset 40-43)
+	binary.LittleEndian.PutUint16(login[40:42], 0)
+	binary.LittleEndian.PutUint16(login[42:44], 0)
+
+	// Get password offset and length, then zero out the password data
+	pwOffset := binary.LittleEndian.Uint16(login[44:46])
+	pwLen := binary.LittleEndian.Uint16(login[46:48])
+	if pwOffset > 0 && pwLen > 0 && int(pwOffset)+int(pwLen)*2 <= len(login) {
+		// Zero out password data (length is in chars, each char is 2 bytes)
+		for i := 0; i < int(pwLen)*2; i++ {
+			login[int(pwOffset)+i] = 0
 		}
-		log.Printf("Building NTLM LOGIN7: TDSVersion=0x%08x majorVersion=0x%02x fixedSize=%d OptionFlags3=0x%02x ClientID=%s",
-			fields.TDSVersion, majorVersion, fixedSize, fields.OptionFlags3, clientIDHex)
 	}
+	// Clear password offset/length
+	binary.LittleEndian.PutUint16(login[44:46], 0)
+	binary.LittleEndian.PutUint16(login[46:48], 0)
 
-	login := make([]byte, fixedSize)
-
-	// TDS Version at offset 4 — forward client's requested version
-	binary.LittleEndian.PutUint32(login[4:8], fields.TDSVersion)
-
-	// PacketSize at offset 8 — use client's requested size
-	pktSize := fields.PacketSize
-	if pktSize == 0 {
-		pktSize = 4096
-	}
-	binary.LittleEndian.PutUint32(login[8:12], pktSize)
-
-	// Forward additional client fields
-	binary.LittleEndian.PutUint32(login[12:16], fields.ClientProgVer)
-	binary.LittleEndian.PutUint32(login[16:20], fields.ClientPID)
-	binary.LittleEndian.PutUint32(login[20:24], fields.ConnectionID)
-
-	// Option/type flags — forward client's values for correct SET behavior
-	login[24] = fields.OptionFlags1
-	login[25] = fields.OptionFlags2 | 0x80 // add fIntSecurity for NTLM
-	login[26] = fields.TypeFlags
-	// OptionFlags3: only forward bits we understand/support
-	// Bit 2 (0x04): fSparseColumnSort - safe to forward
-	// Clear fExtension (0x02) and fUserInstance (0x10) since we don't support those
-	login[27] = fields.OptionFlags3 & 0x04
-
-	// Client timezone and collation LCID
-	binary.LittleEndian.PutUint32(login[28:32], fields.ClientTimeZone)
-	binary.LittleEndian.PutUint32(login[32:36], fields.ClientLCID)
-
-	// Build variable data area with client's fields
-	// Order: HostName, UserName(empty), Password(empty), AppName, ServerName,
-	//        Extension(empty), CltIntName, Language, Database, SSPI,
-	//        AtchDBFile(empty), ChangePassword(empty)
-	varData := make([]byte, 0, 256)
-	writeField := func(offsetPos int, data []byte) {
-		off := fixedSize + len(varData)
-		binary.LittleEndian.PutUint16(login[offsetPos:offsetPos+2], uint16(off))
-		binary.LittleEndian.PutUint16(login[offsetPos+2:offsetPos+4], uint16(len(data)/2)) // char count
-		varData = append(varData, data...)
-	}
-
-	writeField(36, fields.HostName)     // ibHostName=36, cchHostName=38
-	writeField(40, nil)                  // ibUserName=40 (empty, using SSPI)
-	writeField(44, nil)                  // ibPassword=44 (empty, using SSPI)
-	writeField(48, fields.AppName)       // ibAppName=48, cchAppName=50
-	writeField(52, fields.ServerName)    // ibServerName=52, cchServerName=54
-	writeField(56, nil)                  // ibExtension=56 (empty)
-	writeField(60, fields.CltIntName)    // ibCltIntName=60, cchCltIntName=62
-	writeField(64, fields.Language)      // ibLanguage=64, cchLanguage=66
-	writeField(68, fields.Database)      // ibDatabase=68, cchDatabase=70
-
-	// ClientID at offset 72-77 (6-byte fixed field: MAC address / client identifier)
-	if len(fields.ClientID) == 6 {
-		copy(login[72:78], fields.ClientID)
-	}
-
-	// SSPI offset and length (ibSSPI at 78, cbSSPI at 80)
-	sspiOff := fixedSize + len(varData)
-	binary.LittleEndian.PutUint16(login[78:80], uint16(sspiOff))
+	// Append SSPI data after the original variable data
+	sspiOffset := uint16(origLen)
+	binary.LittleEndian.PutUint16(login[78:80], sspiOffset)
 	binary.LittleEndian.PutUint16(login[80:82], uint16(len(sspi)))
-	varData = append(varData, sspi...)
 
-	// Empty fields after SSPI
-	emptyOff := fixedSize + len(varData)
-	binary.LittleEndian.PutUint16(login[82:84], uint16(emptyOff)) // ibAtchDBFile=82
-	binary.LittleEndian.PutUint16(login[84:86], 0)
+	// Append SSPI data to login
+	login = append(login, sspi...)
 
-	// ibChangePassword/cchChangePassword and cbSSPILong only exist for TDS 7.2+
-	if fixedSize >= 94 {
-		binary.LittleEndian.PutUint16(login[86:88], uint16(emptyOff)) // ibChangePassword=86
-		binary.LittleEndian.PutUint16(login[88:90], 0)
-		binary.LittleEndian.PutUint32(login[90:94], 0) // cbSSPILong
-	}
-
-	// Append variable data to login record
-	login = append(login, varData...)
-
-	// Set LOGIN7 total length at offset 0
+	// Update total length at offset 0
 	binary.LittleEndian.PutUint32(login[0:4], uint32(len(login)))
 
 	// Build TDS packet header
@@ -786,6 +724,9 @@ func relay(dst, src net.Conn, direction string, closing *atomic.Bool) {
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
+			if *verbose {
+				introspectRead(direction, buf[:n])
+			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				if closing.Load() {
 					if *verbose {
