@@ -137,8 +137,10 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("[%s] TLS established with server", tag)
 	}
 
-	// Tell client encryption is not supported so it stays plaintext with us
+	// Tell client encryption and MARS are not supported so it stays plaintext
+	// and doesn't expect SMUX framing
 	disableEncryption(serverPreLogin)
+	disableMARS(serverPreLogin)
 	if _, err := clientConn.Write(serverPreLogin); err != nil {
 		log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
 		return
