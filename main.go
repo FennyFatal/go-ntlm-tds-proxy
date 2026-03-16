@@ -93,8 +93,9 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("[%s] Received client pre-login (%d bytes)", tag, len(clientPreLogin))
 	}
 
-	// NOTE: MARS disabling temporarily disabled for testing
-	// disableMARS(clientPreLogin)
+	// Disable MARS in client's PRELOGIN before forwarding to server.
+	// MARS causes SMUX framing issues in the relay.
+	disableMARS(clientPreLogin)
 
 	if _, err := rawRemote.Write(clientPreLogin); err != nil {
 		log.Printf("[%s] Failed to send pre-login to server: %v", tag, err)
@@ -134,10 +135,10 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("[%s] TLS established with server", tag)
 	}
 
-	// Tell client encryption is not supported so it stays plaintext
+	// Tell client encryption and MARS are not supported so it stays plaintext
+	// and doesn't expect SMUX framing
 	disableEncryption(serverPreLogin)
-	// NOTE: MARS disabling temporarily disabled for testing
-	// disableMARS(serverPreLogin)
+	disableMARS(serverPreLogin)
 	if _, err := clientConn.Write(serverPreLogin); err != nil {
 		log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
 		return
