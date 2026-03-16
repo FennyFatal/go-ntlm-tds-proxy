@@ -202,9 +202,13 @@ type Credentials struct {
 type LoginFields struct {
 	TDSVersion     uint32
 	PacketSize     uint32
+	ClientProgVer  uint32
+	ClientPID      uint32
+	ConnectionID   uint32
 	OptionFlags1   byte
 	OptionFlags2   byte // client's original flags (we'll OR in fIntSecurity)
 	TypeFlags      byte
+	OptionFlags3   byte
 	ClientTimeZone uint32
 	ClientLCID     uint32
 	HostName       []byte
@@ -288,9 +292,13 @@ func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
 	fields := &LoginFields{
 		TDSVersion:     binary.LittleEndian.Uint32(loginData[4:8]),
 		PacketSize:     binary.LittleEndian.Uint32(loginData[8:12]),
+		ClientProgVer:  binary.LittleEndian.Uint32(loginData[12:16]),
+		ClientPID:      binary.LittleEndian.Uint32(loginData[16:20]),
+		ConnectionID:   binary.LittleEndian.Uint32(loginData[20:24]),
 		OptionFlags1:   loginData[24],
 		OptionFlags2:   loginData[25],
 		TypeFlags:      loginData[26],
+		OptionFlags3:   loginData[27],
 		ClientTimeZone: binary.LittleEndian.Uint32(loginData[28:32]),
 		ClientLCID:     binary.LittleEndian.Uint32(loginData[32:36]),
 	}
@@ -623,12 +631,16 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	}
 	binary.LittleEndian.PutUint32(login[8:12], pktSize)
 
+	// Forward additional client fields
+	binary.LittleEndian.PutUint32(login[12:16], fields.ClientProgVer)
+	binary.LittleEndian.PutUint32(login[16:20], fields.ClientPID)
+	binary.LittleEndian.PutUint32(login[20:24], fields.ConnectionID)
+
 	// Option/type flags — forward client's values for correct SET behavior
 	login[24] = fields.OptionFlags1
 	login[25] = fields.OptionFlags2 | 0x80 // add fIntSecurity for NTLM
 	login[26] = fields.TypeFlags
-	// OptionFlags3 (offset 27): leave as 0 — don't set fExtension since we
-	// don't forward the FEATUREEXT block
+	login[27] = fields.OptionFlags3 &^ 0x02 // clear fExtension bit since we don't forward FEATUREEXT
 
 	// Client timezone and collation LCID
 	binary.LittleEndian.PutUint32(login[28:32], fields.ClientTimeZone)
