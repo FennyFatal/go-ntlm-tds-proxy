@@ -93,7 +93,12 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("[%s] Received client pre-login (%d bytes)", tag, len(clientPreLogin))
 	}
 
-	// Forward client pre-login to server UNMODIFIED (server needs to see encryption support)
+	// Disable MARS in client's PRELOGIN before forwarding to server.
+	// If MARS is enabled on the server but not the client (because we sit in between),
+	// the server would use SMUX framing that the client doesn't expect.
+	// By disabling it on both sides, we avoid any framing mismatch.
+	disableMARS(clientPreLogin)
+
 	if _, err := rawRemote.Write(clientPreLogin); err != nil {
 		log.Printf("[%s] Failed to send pre-login to server: %v", tag, err)
 		return
@@ -404,6 +409,38 @@ func (c *tdsHandshakeConn) SetDeadline(t time.Time) error      { return c.conn.S
 func (c *tdsHandshakeConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
 func (c *tdsHandshakeConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
 
+// disableMARS patches the MARS option in a TDS PRELOGIN packet to disabled (0x00).
+// MARS (Multiple Active Result Sets) causes the server to use SMUX framing for all
+// post-login data, which breaks the relay since the client doesn't expect it.
+func disableMARS(packet []byte) {
+	if len(packet) < 8 {
+		return
+	}
+	data := packet[8:] // skip TDS header
+	pos := 0
+	for pos < len(data) {
+		optType := data[pos]
+		if optType == 0xFF { // terminator
+			break
+		}
+		if pos+5 > len(data) {
+			break
+		}
+		offset := int(binary.BigEndian.Uint16(data[pos+1 : pos+3]))
+
+		if optType == 0x04 { // MARS option
+			if offset < len(data) {
+				if *verbose && data[offset] != 0x00 {
+					log.Printf("Patching MARS option from 0x%02x to 0x00 (disabled)", data[offset])
+				}
+				data[offset] = 0x00 // MARS disabled
+			}
+			return
+		}
+		pos += 5
+	}
+}
+
 // disableEncryption patches the ENCRYPTION option in a TDS PRELOGIN packet
 // to ENCRYPT_NOT_SUP (0x02), preventing TLS negotiation that the relay can't handle.
 func disableEncryption(packet []byte) {
@@ -699,6 +736,21 @@ func relay(dst, src net.Conn, direction string, closing *atomic.Bool) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
+		if n > 0 {
+			if *verbose {
+				introspectRead(direction, buf[:n])
+			}
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				if closing.Load() {
+					if *verbose {
+						log.Printf("%s: closing (%v)", direction, writeErr)
+					}
+				} else {
+					log.Printf("%s write error: %v", direction, writeErr)
+				}
+				return
+			}
+		}
 		if err != nil {
 			if err == io.EOF {
 				if *verbose {
@@ -711,21 +763,6 @@ func relay(dst, src net.Conn, direction string, closing *atomic.Bool) {
 				}
 			} else {
 				log.Printf("%s read error: %v", direction, err)
-			}
-			return
-		}
-
-		if *verbose {
-			introspectRead(direction, buf[:n])
-		}
-
-		if _, err := dst.Write(buf[:n]); err != nil {
-			if closing.Load() {
-				if *verbose {
-					log.Printf("%s: closing (%v)", direction, err)
-				}
-			} else {
-				log.Printf("%s write error: %v", direction, err)
 			}
 			return
 		}
@@ -749,11 +786,14 @@ func introspectRead(direction string, data []byte) {
 		if pktStatus&0x01 != 0 {
 			statusFlags += "EOM "
 		}
+		if pktStatus&0x02 != 0 {
+			statusFlags += "IGNORE "
+		}
 		if pktStatus&0x04 != 0 {
 			statusFlags += "RESETCONN "
 		}
 		if pktStatus&0x08 != 0 {
-			statusFlags += "RESETCONNTRAN "
+			statusFlags += "RESETCONNSKIPTRAN "
 		}
 		if statusFlags == "" {
 			statusFlags = "none"
