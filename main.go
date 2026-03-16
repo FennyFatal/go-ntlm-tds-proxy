@@ -637,15 +637,19 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 	binary.LittleEndian.PutUint32(login[8:12], pktSize)
 
 	// Forward additional client fields
-	binary.LittleEndian.PutUint32(login[12:16], fields.ClientProgVer)
-	binary.LittleEndian.PutUint32(login[16:20], fields.ClientPID)
-	binary.LittleEndian.PutUint32(login[20:24], fields.ConnectionID)
+	// NOTE: Temporarily zeroing these to test if they're causing issues
+	binary.LittleEndian.PutUint32(login[12:16], 0) // fields.ClientProgVer
+	binary.LittleEndian.PutUint32(login[16:20], 0) // fields.ClientPID
+	binary.LittleEndian.PutUint32(login[20:24], 0) // fields.ConnectionID
 
 	// Option/type flags — forward client's values for correct SET behavior
 	login[24] = fields.OptionFlags1
 	login[25] = fields.OptionFlags2 | 0x80 // add fIntSecurity for NTLM
 	login[26] = fields.TypeFlags
-	login[27] = fields.OptionFlags3 // forward as-is for now
+	// OptionFlags3: only forward bits we understand/support
+	// Bit 2 (0x04): fSparseColumnSort - safe to forward
+	// Clear fExtension (0x02) and fUserInstance (0x10) since we don't support those
+	login[27] = fields.OptionFlags3 & 0x04
 
 	// Client timezone and collation LCID
 	binary.LittleEndian.PutUint32(login[28:32], fields.ClientTimeZone)
