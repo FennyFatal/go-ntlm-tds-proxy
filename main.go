@@ -153,14 +153,14 @@ func parseLoginPacket(data []byte) (*Credentials, error) {
 	}
 
 	// Offset and length fields are at these positions (2 bytes each):
-	// Hostname: offset 28, length 30
-	// Username: offset 40, length 42
-	// Password: offset 46, length 48
-	// AppName: offset 52, length 54
-	// ServerName: offset 58, length 60
-	readField := func(offsetPos, lengthPos int) (string, error) {
+	// Hostname: ibHostName=36, cchHostName=38
+	// Username: ibUserName=40, cchUserName=42
+	// Password: ibPassword=44, cchPassword=46
+	// AppName: ibAppName=48, cchAppName=50
+	// ServerName: ibServerName=52, cchServerName=54
+	readRawField := func(offsetPos, lengthPos int) ([]byte, error) {
 		if len(loginData) < lengthPos+2 {
-			return "", nil
+			return nil, nil
 		}
 		offset := binary.LittleEndian.Uint16(loginData[offsetPos : offsetPos+2])
 		length := binary.LittleEndian.Uint16(loginData[lengthPos : lengthPos+2])
@@ -168,20 +168,27 @@ func parseLoginPacket(data []byte) (*Credentials, error) {
 		// Length is in characters, each char is 2 bytes (UTF-16LE)
 		end := int(offset) + int(length)*2
 		if end > len(loginData) {
-			return "", nil
+			return nil, nil
 		}
-		field := decodeUTF16LE(loginData[offset:end])
-		return field, nil
+		return loginData[offset:end], nil
 	}
 
-	username, err := readField(40, 42)
+	usernameRaw, err := readRawField(40, 42)
 	if err != nil {
 		return nil, err
 	}
-	password, err := readField(46, 48)
+	username := decodeUTF16LE(usernameRaw)
+
+	passwordRaw, err := readRawField(44, 46)
 	if err != nil {
 		return nil, err
 	}
+	// Decode TDS LOGIN7 password obfuscation before UTF-16LE decoding
+	for i := range passwordRaw {
+		b := passwordRaw[i] ^ 0xA5
+		passwordRaw[i] = (b << 4) | (b >> 4)
+	}
+	password := decodeUTF16LE(passwordRaw)
 
 	// Parse domain\username format
 	domain := ""
@@ -291,34 +298,33 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 }
 
 func buildNTLMLoginPacket(sspi []byte) []byte {
-	// Build a minimal TDS login packet with SSPI data
-	// This is a simplified version - real implementation needs proper offsets
-
-	// Fixed header for login packet
-	packet := make([]byte, 0)
-
-	// TDS Header
-	packet = append(packet, 0x10)                 // Type: TDS7 Login
-	packet = append(packet, 0x01)                 // Status: End of message
-	packet = append(packet, 0x00, 0x00)           // Length (will be filled)
-	packet = append(packet, 0x00, 0x00)           // SPID
-	packet = append(packet, 0x00)                 // Packet ID
-	packet = append(packet, 0x00)                 // Window
+	// Build a minimal TDS LOGIN7 packet with SSPI data
+	const fixedSize = 86
 
 	// Build login7 structure
-	login := make([]byte, 86+4) // Base size + SSPI field
-	binary.LittleEndian.PutUint32(login[0:4], uint32(0x71000001)) // Length
+	login := make([]byte, fixedSize)
 
-	// Set SSPI offset and length (offset 78, length 80)
-	sspiOffset := uint16(len(login) - 4) // Offset to SSPI data
-	binary.LittleEndian.PutUint16(login[78:80], sspiOffset)
+	// TDS Version at offset 4 (TDS 7.1)
+	binary.LittleEndian.PutUint32(login[4:8], 0x71000001)
+
+	// OptionFlags2 at offset 25: set fIntSecurity (0x80) for NTLM/SSPI
+	login[25] = 0x80
+
+	// Set SSPI offset and length (ibSSPI at 78, cbSSPI at 80)
+	binary.LittleEndian.PutUint16(login[78:80], uint16(fixedSize))
 	binary.LittleEndian.PutUint16(login[80:82], uint16(len(sspi)))
 
-	// Append SSPI data
+	// Append SSPI data to login record
 	login = append(login, sspi...)
 
-	// Update total length
-	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)+len(login)))
+	// Set LOGIN7 total length at offset 0
+	binary.LittleEndian.PutUint32(login[0:4], uint32(len(login)))
+
+	// Build TDS packet header
+	packet := make([]byte, 8)
+	packet[0] = 0x10 // Type: TDS7 Login
+	packet[1] = 0x01 // Status: End of message
+	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(login)))
 
 	return append(packet, login...)
 }
@@ -328,38 +334,41 @@ func extractSSPI(packet []byte) ([]byte, error) {
 		return nil, fmt.Errorf("packet too short")
 	}
 
-	// Skip header
+	// Skip TDS header
 	data := packet[8:]
 
-	// Look for SSPI data based on offset in the packet
-	// For a challenge response, SSPI data starts after some header bytes
-	// This is simplified - actual parsing depends on token type
+	// Check packet type - server login response is Tabular Result (0x04)
+	if packet[0] != 0x04 {
+		return nil, fmt.Errorf("unexpected packet type 0x%02x, expected 0x04", packet[0])
+	}
 
-	// Check packet type
-	if packet[0] == 0x04 { // Tabular Result
-		// Parse tokens to find SSPI
-		pos := 0
-		for pos < len(data) {
-			if pos >= len(data) {
-				break
-			}
-			token := data[pos]
-			pos++
+	// Parse TDS tokens to find SSPI (0xED)
+	pos := 0
+	for pos < len(data) {
+		token := data[pos]
+		pos++
 
-			switch token {
-			case 0xFD: // SSPI token
-				if pos+1 >= len(data) {
-					return nil, fmt.Errorf("malformed SSPI token")
-				}
-				length := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
-				pos += 2
-				if pos+length > len(data) {
-					return nil, fmt.Errorf("SSPI data truncated")
-				}
-				return data[pos : pos+length], nil
-			case 0xAA: // Done token
-				break
+		switch token {
+		case 0xED: // SSPI token
+			if pos+2 > len(data) {
+				return nil, fmt.Errorf("malformed SSPI token")
 			}
+			length := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			pos += 2
+			if pos+length > len(data) {
+				return nil, fmt.Errorf("SSPI data truncated")
+			}
+			return data[pos : pos+length], nil
+		case 0xFD, 0xFE, 0xFF: // DONE / DONEPROC / DONEINPROC
+			// Reached end-of-message tokens without finding SSPI
+			return nil, fmt.Errorf("no SSPI data found (reached DONE token)")
+		default:
+			// Skip unknown tokens by reading their 2-byte length prefix
+			if pos+2 > len(data) {
+				return nil, fmt.Errorf("unexpected end of data at token 0x%02x", token)
+			}
+			tlen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			pos += 2 + tlen
 		}
 	}
 
@@ -367,24 +376,53 @@ func extractSSPI(packet []byte) ([]byte, error) {
 }
 
 func sendLoginAck(conn net.Conn) error {
-	// Send a login success packet to the client
-	// This is a simplified TDS login ack
+	// Build TDS response body with LOGINACK + DONE tokens
+	var body []byte
 
-	packet := []byte{
-		0x04,                   // Type: Tabular Result
-		0x01,                   // Status: End of message
-		0x00, 0x0B,             // Length
-		0x00, 0x00,             // SPID
-		0x00,                   // Packet ID
-		0x00,                   // Window
-		0xAA,                   // Environment change token
-		0x01, 0x00,             // Length
-		0x00,                   // Type
-		0x00,                   // Done
+	// LOGINACK token (0xAD)
+	ackData := []byte{
+		0x01,                   // Interface: SQL_TSQL
+		0x71, 0x00, 0x00, 0x01, // TDS Version 7.1
 	}
+	// Program name "Relay" as length-prefixed UTF-16LE
+	progName := utf16LEEncode("Relay")
+	ackData = append(ackData, byte(len(progName)/2)) // length in chars
+	ackData = append(ackData, progName...)
+	// Program version (major.minor.buildHi.buildLo)
+	ackData = append(ackData, 0x01, 0x00, 0x00, 0x00)
 
+	body = append(body, 0xAD) // LOGINACK token type
+	lenBytes := make([]byte, 2)
+	binary.LittleEndian.PutUint16(lenBytes, uint16(len(ackData)))
+	body = append(body, lenBytes...)
+	body = append(body, ackData...)
+
+	// DONE token (0xFD)
+	body = append(body,
+		0xFD,
+		0x00, 0x00, // Status: DONE_FINAL
+		0x00, 0x00, // CurCmd
+		0x00, 0x00, 0x00, 0x00, // DoneRowCount (4 bytes for TDS 7.1)
+	)
+
+	// Build TDS packet header
+	packet := make([]byte, 8)
+	packet[0] = 0x04 // Type: Tabular Result
+	packet[1] = 0x01 // Status: End of message
+	binary.BigEndian.PutUint16(packet[2:4], uint16(8+len(body)))
+
+	packet = append(packet, body...)
 	_, err := conn.Write(packet)
 	return err
+}
+
+func utf16LEEncode(s string) []byte {
+	runes := utf16.Encode([]rune(s))
+	b := make([]byte, len(runes)*2)
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(b[i*2:], r)
+	}
+	return b
 }
 
 func relay(dst, src net.Conn, direction string) {
