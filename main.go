@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -169,8 +170,15 @@ func handleConnection(clientConn net.Conn) {
 
 	// Phase 5: Relay all subsequent traffic (plaintext client <-> TLS server)
 	log.Printf("Starting bidirectional relay")
-	go relay(serverConn, clientConn, "server->client")
-	relay(clientConn, serverConn, "client->server")
+	done := make(chan struct{})
+	go func() {
+		relay(clientConn, serverConn, "server->client")
+		clientConn.Close()
+		close(done)
+	}()
+	relay(serverConn, clientConn, "client->server")
+	serverConn.Close()
+	<-done
 }
 
 type Credentials struct {
@@ -477,18 +485,33 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) ([]byte, error) {
 		log.Printf("Sent NTLM Type 3 (%d bytes)", len(authenticate))
 	}
 
-	// Read the server's auth response (LOGINACK + env changes + DONE)
-	response, err := readTDSPacket(conn, "server-auth-response")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read auth response: %w", err)
+	// Read ALL packets of the server's auth response until EOM
+	// (LOGINACK + env changes + DONE may span multiple TDS packets)
+	var fullResponse []byte
+	for {
+		packet, err := readTDSPacket(conn, "server-auth-response")
+		if err != nil {
+			return nil, fmt.Errorf("failed to read auth response: %w", err)
+		}
+
+		// First packet must be a tabular result (0x04)
+		if len(fullResponse) == 0 && packet[0] != 0x04 {
+			return nil, fmt.Errorf("authentication rejected by server (packet type 0x%02x)", packet[0])
+		}
+
+		fullResponse = append(fullResponse, packet...)
+
+		// Check EOM flag (status byte, bit 0)
+		if packet[1]&0x01 != 0 {
+			break
+		}
 	}
 
-	// Check if it's a tabular result (0x04) or error
-	if response[0] != 0x04 {
-		return nil, fmt.Errorf("authentication rejected by server (packet type 0x%02x)", response[0])
+	if *verbose {
+		log.Printf("Auth response: %d bytes total", len(fullResponse))
 	}
 
-	return response, nil
+	return fullResponse, nil
 }
 
 func buildNTLMLoginPacket(sspi []byte) []byte {
@@ -594,19 +617,23 @@ func extractSSPI(packet []byte) ([]byte, error) {
 	return nil, fmt.Errorf("no SSPI data found in packet")
 }
 
+func isClosedErr(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
+}
+
 func relay(dst, src net.Conn, direction string) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
 		if err != nil {
-			if err != io.EOF && *verbose {
+			if err != io.EOF && !isClosedErr(err) && *verbose {
 				log.Printf("%s relay error: %v", direction, err)
 			}
 			return
 		}
 
 		if _, err := dst.Write(buf[:n]); err != nil {
-			if *verbose {
+			if !isClosedErr(err) && *verbose {
 				log.Printf("%s write error: %v", direction, err)
 			}
 			return
