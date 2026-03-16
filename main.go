@@ -196,16 +196,18 @@ type Credentials struct {
 // LoginFields holds data from the client's LOGIN7 packet to forward in the
 // NTLM LOGIN7 we send to the server.
 type LoginFields struct {
-	// FixedPrefix is the first 36 bytes of the LOGIN7 body (before offset/length pairs).
-	// Contains TDSVersion, PacketSize, ClientProgVer, ClientPID, ConnectionID,
-	// OptionFlags1-3, TypeFlags, ClientTimeZone, ClientLCID.
-	FixedPrefix []byte
-	HostName    []byte
-	AppName     []byte
-	ServerName  []byte
-	CltIntName  []byte
-	Language    []byte
-	Database    []byte
+	PacketSize     uint32
+	OptionFlags1   byte
+	OptionFlags2   byte // client's original flags (we'll OR in fIntSecurity)
+	TypeFlags      byte
+	ClientTimeZone uint32
+	ClientLCID     uint32
+	HostName       []byte
+	AppName        []byte
+	ServerName     []byte
+	CltIntName     []byte
+	Language       []byte
+	Database       []byte
 }
 
 func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
@@ -277,11 +279,14 @@ func parseLoginPacket(data []byte) (*Credentials, *LoginFields, error) {
 		user = parts[1]
 	}
 
-	// Extract fields to forward to server — copy the raw fixed prefix (first 36 bytes)
-	// which includes TDS version, packet size, client version, PID, connection ID,
-	// all option/type flags, timezone, and collation LCID.
+	// Extract fields to forward to server
 	fields := &LoginFields{
-		FixedPrefix: append([]byte(nil), loginData[0:36]...),
+		PacketSize:     binary.LittleEndian.Uint32(loginData[8:12]),
+		OptionFlags1:   loginData[24],
+		OptionFlags2:   loginData[25],
+		TypeFlags:      loginData[26],
+		ClientTimeZone: binary.LittleEndian.Uint32(loginData[28:32]),
+		ClientLCID:     binary.LittleEndian.Uint32(loginData[32:36]),
 	}
 	fields.HostName, _ = readRawField(36, 38)
 	fields.AppName, _ = readRawField(48, 50)
@@ -559,18 +564,26 @@ func buildNTLMLoginPacket(sspi []byte, fields *LoginFields) []byte {
 
 	login := make([]byte, fixedSize)
 
-	// Copy client's fixed prefix (first 36 bytes): TDS version, packet size,
-	// client version, PID, connection ID, all option/type flags, timezone, LCID
-	copy(login[0:36], fields.FixedPrefix)
+	// TDS Version at offset 4 (TDS 7.4) — must match 94-byte header format
+	binary.LittleEndian.PutUint32(login[4:8], 0x74000004)
 
-	// Fix up flags for NTLM auth:
-	// - Clear ConnectionID (offset 20-23): we're making a new connection, not reconnecting
-	binary.LittleEndian.PutUint32(login[20:24], 0)
-	// - Set fIntSecurity (0x80) in OptionFlags2 while preserving client's other flags
-	//   (e.g. fODBC=0x02 which affects quoted identifier and ANSI null behavior)
-	login[25] |= 0x80
-	// - Clear fExtension (0x10) in OptionFlags3: we don't forward the FEATUREEXT block
-	login[27] &^= 0x10
+	// PacketSize at offset 8 — use client's requested size
+	pktSize := fields.PacketSize
+	if pktSize == 0 {
+		pktSize = 4096
+	}
+	binary.LittleEndian.PutUint32(login[8:12], pktSize)
+
+	// Option/type flags — forward client's values for correct SET behavior
+	login[24] = fields.OptionFlags1
+	login[25] = fields.OptionFlags2 | 0x80 // add fIntSecurity for NTLM
+	login[26] = fields.TypeFlags
+	// OptionFlags3 (offset 27): leave as 0 — don't set fExtension since we
+	// don't forward the FEATUREEXT block
+
+	// Client timezone and collation LCID
+	binary.LittleEndian.PutUint32(login[28:32], fields.ClientTimeZone)
+	binary.LittleEndian.PutUint32(login[32:36], fields.ClientLCID)
 
 	// Build variable data area with client's fields
 	// Order: HostName, UserName(empty), Password(empty), AppName, ServerName,
