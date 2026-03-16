@@ -489,7 +489,8 @@ func performNTLMAuth(conn net.Conn, creds *Credentials) error {
 
 func buildNTLMLoginPacket(sspi []byte) []byte {
 	// Build a TDS LOGIN7 packet with SSPI data for NTLM Type 1 (Negotiate)
-	const fixedSize = 86
+	// TDS 7.2+ requires a 94-byte fixed header (86 base + ibChangePassword/cchChangePassword + cbSSPILong)
+	const fixedSize = 94
 
 	login := make([]byte, fixedSize)
 
@@ -504,16 +505,18 @@ func buildNTLMLoginPacket(sspi []byte) []byte {
 
 	// Point all variable-length field offsets to the start of the variable data
 	// area (right after the fixed header). All lengths are 0 (empty fields).
-	// Offsets: ibHostName=36, ibUserName=40, ibPassword=44, ibAppName=48,
-	//          ibServerName=52, ibExtension=56, ibCltIntName=60,
-	//          ibLanguage=64, ibDatabase=68, ibAtchDBFile=82
-	for _, off := range []int{36, 40, 44, 48, 52, 56, 60, 64, 68, 82} {
+	// ibHostName=36, ibUserName=40, ibPassword=44, ibAppName=48,
+	// ibServerName=52, ibExtension=56, ibCltIntName=60,
+	// ibLanguage=64, ibDatabase=68, ibAtchDBFile=82, ibChangePassword=86
+	for _, off := range []int{36, 40, 44, 48, 52, 56, 60, 64, 68, 82, 86} {
 		binary.LittleEndian.PutUint16(login[off:off+2], uint16(fixedSize))
 	}
 
 	// SSPI offset and length (ibSSPI at 78, cbSSPI at 80)
 	binary.LittleEndian.PutUint16(login[78:80], uint16(fixedSize))
 	binary.LittleEndian.PutUint16(login[80:82], uint16(len(sspi)))
+	// cbSSPILong at offset 90 (used when cbSSPI=0xFFFF; 0 otherwise)
+	binary.LittleEndian.PutUint32(login[90:94], 0)
 
 	// Append SSPI data to login record
 	login = append(login, sspi...)
