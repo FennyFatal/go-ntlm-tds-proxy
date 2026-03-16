@@ -40,6 +40,7 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
+		log.Printf("New connection from %s", conn.RemoteAddr())
 		go handleConnection(conn)
 	}
 }
@@ -69,6 +70,9 @@ func handleConnection(clientConn net.Conn) {
 		log.Printf("Received client pre-login (%d bytes)", len(clientPreLogin))
 	}
 
+	// Disable encryption in client's pre-login before forwarding to server
+	disableEncryption(clientPreLogin)
+
 	// Forward pre-login to server
 	if _, err := remoteConn.Write(clientPreLogin); err != nil {
 		log.Printf("Failed to send pre-login to server: %v", err)
@@ -85,6 +89,9 @@ func handleConnection(clientConn net.Conn) {
 	if *verbose {
 		log.Printf("Received server pre-login response (%d bytes)", len(serverPreLogin))
 	}
+
+	// Disable encryption in server's response before forwarding to client
+	disableEncryption(serverPreLogin)
 
 	// Forward to client
 	if _, err := clientConn.Write(serverPreLogin); err != nil {
@@ -211,6 +218,38 @@ func decodeUTF16LE(data []byte) string {
 		result[i] = binary.LittleEndian.Uint16(data[i*2 : i*2+2])
 	}
 	return strings.ReplaceAll(string(utf16.Decode(result)), "\x00", "")
+}
+
+// disableEncryption patches the ENCRYPTION option in a TDS PRELOGIN packet
+// to ENCRYPT_NOT_SUP (0x02), preventing TLS negotiation that the relay can't handle.
+func disableEncryption(packet []byte) {
+	if len(packet) < 8 {
+		return
+	}
+	data := packet[8:] // skip TDS header
+	pos := 0
+	for pos < len(data) {
+		optType := data[pos]
+		if optType == 0xFF { // terminator
+			break
+		}
+		if pos+5 > len(data) {
+			break
+		}
+		offset := int(binary.BigEndian.Uint16(data[pos+1 : pos+3]))
+		// length at data[pos+3:pos+5]
+
+		if optType == 0x01 { // ENCRYPTION option
+			if offset < len(data) {
+				if *verbose {
+					log.Printf("Patching ENCRYPTION option from 0x%02x to 0x02 (ENCRYPT_NOT_SUP)", data[offset])
+				}
+				data[offset] = 0x02 // ENCRYPT_NOT_SUP
+			}
+			return
+		}
+		pos += 5
+	}
 }
 
 func readTDSPacket(conn net.Conn) ([]byte, error) {
