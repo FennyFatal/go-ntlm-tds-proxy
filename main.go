@@ -25,11 +25,14 @@ import (
 )
 
 var (
-	listenAddr  = flag.String("listen", ":1433", "Address to listen on")
-	remoteAddr  = flag.String("remote", "", "Remote SQL Server address (host:port)")
-	verbose     = flag.Bool("v", false, "Verbose logging")
-	connCounter uint64
-	relayCert   tls.Certificate
+	port           = flag.Int("port", 1433, "Port to listen on")
+	listen         = flag.Bool("listen", false, "Listen on all interfaces (default is localhost only)")
+	remoteAddr     = flag.String("remote", "", "Remote SQL Server address (host:port)")
+	allowRemoteEnv = flag.Bool("allow-remote-env", false, "Allow use_env credentials when listening on all interfaces")
+	verbose        = flag.Bool("v", false, "Verbose logging")
+	connCounter    uint64
+	relayCert      tls.Certificate
+	listenIsLocal  bool
 )
 
 func generateSelfSignedCert() (tls.Certificate, error) {
@@ -62,6 +65,20 @@ func main() {
 		log.Fatal("Must specify -remote flag with SQL Server address")
 	}
 
+	// Determine listen addresses based on flags
+	listenIsLocal = !*listen
+	portStr := fmt.Sprintf("%d", *port)
+
+	var addr4, addr6 string
+	if *listen {
+		addr4 = "0.0.0.0:" + portStr
+		addr6 = "[::]:" + portStr
+		log.Printf("WARNING: Listening on all interfaces — relay is accessible from the network")
+	} else {
+		addr4 = "127.0.0.1:" + portStr
+		addr6 = "[::1]:" + portStr
+	}
+
 	var err error
 	relayCert, err = generateSelfSignedCert()
 	if err != nil {
@@ -69,21 +86,25 @@ func main() {
 	}
 
 	// Listen on both IPv4 and IPv6 explicitly
-	ln4, err := net.Listen("tcp4", *listenAddr)
+	ln4, err := net.Listen("tcp4", addr4)
 	if err != nil {
-		log.Fatalf("Failed to listen (IPv4) on %s: %v", *listenAddr, err)
+		log.Fatalf("Failed to listen (IPv4) on %s: %v", addr4, err)
 	}
 	defer ln4.Close()
 
-	ln6, err := net.Listen("tcp6", *listenAddr)
+	ln6, err := net.Listen("tcp6", addr6)
 	if err != nil {
-		log.Printf("Warning: could not listen on IPv6 %s: %v", *listenAddr, err)
+		log.Printf("Warning: could not listen on IPv6 %s: %v", addr6, err)
 		ln6 = nil
 	} else {
 		defer ln6.Close()
 	}
 
-	log.Printf("SQL NTLM Relay listening on %s (IPv4+IPv6), proxying to %s", *listenAddr, *remoteAddr)
+	displayAddr := addr4
+	if ln6 != nil {
+		displayAddr = fmt.Sprintf("%s + %s", addr4, addr6)
+	}
+	log.Printf("SQL NTLM Relay listening on %s, proxying to %s", displayAddr, *remoteAddr)
 
 	accept := func(ln net.Listener, tag string) {
 		for {
@@ -213,7 +234,13 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	// Override credentials from environment if client sends "use_env" as a sentinel
-	if credentials.Username == "use_env" || (credentials.Domain != "" && credentials.Domain+"\\"+credentials.Username == "use_env") {
+	usernameIsEnv := credentials.Username == "use_env" || (credentials.Domain != "" && credentials.Domain+"\\"+credentials.Username == "use_env")
+	passwordIsEnv := credentials.Password == "use_env"
+	if (usernameIsEnv || passwordIsEnv) && !listenIsLocal && !*allowRemoteEnv {
+		log.Printf("[%s] Rejecting use_env: listening on all interfaces without --allow-remote-env", tag)
+		return
+	}
+	if usernameIsEnv {
 		envUser := os.Getenv("NTLM_USERNAME")
 		if envUser == "" {
 			log.Printf("[%s] Username is 'use_env' but NTLM_USERNAME is not set", tag)
@@ -226,7 +253,7 @@ func handleConnection(clientConn net.Conn) {
 			credentials.Username = envUser
 		}
 	}
-	if credentials.Password == "use_env" {
+	if passwordIsEnv {
 		envPass := os.Getenv("NTLM_PASSWORD")
 		if envPass == "" {
 			log.Printf("[%s] Password is 'use_env' but NTLM_PASSWORD is not set", tag)

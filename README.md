@@ -13,16 +13,18 @@ go build -o sql-ntlm-relay .
 ## Usage
 
 ```sh
-sql-ntlm-relay -listen :11433 -remote sqlserver.corp.example.com:1433 [-v]
+sql-ntlm-relay -port 11433 -remote sqlserver.corp.example.com:1433 [-v]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-listen` | `:1433` | Local address to listen on |
+| `-port` | `1433` | Port to listen on (binds to localhost only) |
+| `-listen` | `false` | Listen on all interfaces instead of localhost |
 | `-remote` | (required) | Remote SQL Server `host:port` |
+| `-allow-remote-env` | `false` | Allow `use_env` credentials when `-listen` is set |
 | `-v` | `false` | Verbose TDS packet logging |
 
-The relay listens on both IPv4 and IPv6. Enter your SQL/Windows credentials in the client — the relay extracts them from the plaintext LOGIN7, then performs NTLM authentication with the remote server using those credentials.
+By default the relay binds to `127.0.0.1` and `[::1]` (localhost only) on both IPv4 and IPv6. Use `-listen` to bind to all interfaces — a warning is logged when this mode is active.
 
 ## Environment Variable Credentials
 
@@ -31,10 +33,12 @@ To avoid entering credentials in the client (useful for shared configs or CI), s
 ```sh
 export NTLM_USERNAME='DOMAIN\username'
 export NTLM_PASSWORD='yourpassword'
-sql-ntlm-relay -listen :11433 -remote sqlserver.corp.example.com:1433
+sql-ntlm-relay -port 11433 -remote sqlserver.corp.example.com:1433
 ```
 
 Then in your client, use `use_env` as the username and/or password. Either field can be overridden independently — you can use a real username in the client and only set the password via env, or vice versa.
+
+**Security note:** `use_env` is only allowed when bound to localhost (the default). If you use `-listen` to expose the relay on all interfaces, `use_env` is blocked — anyone on the network could connect and have the relay authenticate with your credentials. Pass `-allow-remote-env` to override this restriction if you understand the risk.
 
 ## Client Configuration
 
