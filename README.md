@@ -24,6 +24,18 @@ sql-ntlm-relay -listen :11433 -remote sqlserver.corp.example.com:1433 [-v]
 
 The relay listens on both IPv4 and IPv6. Enter your SQL/Windows credentials in the client — the relay extracts them from the plaintext LOGIN7, then performs NTLM authentication with the remote server using those credentials.
 
+## Environment Variable Credentials
+
+To avoid entering credentials in the client (useful for shared configs or CI), set the username and/or password to the literal string `use_env`. The relay will read the actual values from environment variables:
+
+```sh
+export NTLM_USERNAME='DOMAIN\username'
+export NTLM_PASSWORD='yourpassword'
+sql-ntlm-relay -listen :11433 -remote sqlserver.corp.example.com:1433
+```
+
+Then in your client, use `use_env` as the username and/or password. Either field can be overridden independently — you can use a real username in the client and only set the password via env, or vice versa.
+
 ## Client Configuration
 
 The relay presents a self-signed TLS certificate, so clients must be configured to trust it.

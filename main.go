@@ -15,6 +15,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -209,6 +210,29 @@ func handleConnection(clientConn net.Conn) {
 	if err != nil {
 		log.Printf("[%s] Failed to parse login packet: %v", tag, err)
 		return
+	}
+
+	// Override credentials from environment if client sends "use_env" as a sentinel
+	if credentials.Username == "use_env" || (credentials.Domain != "" && credentials.Domain+"\\"+credentials.Username == "use_env") {
+		envUser := os.Getenv("NTLM_USERNAME")
+		if envUser == "" {
+			log.Printf("[%s] Username is 'use_env' but NTLM_USERNAME is not set", tag)
+			return
+		}
+		if parts := strings.SplitN(envUser, "\\", 2); len(parts) == 2 {
+			credentials.Domain = parts[0]
+			credentials.Username = parts[1]
+		} else {
+			credentials.Username = envUser
+		}
+	}
+	if credentials.Password == "use_env" {
+		envPass := os.Getenv("NTLM_PASSWORD")
+		if envPass == "" {
+			log.Printf("[%s] Password is 'use_env' but NTLM_PASSWORD is not set", tag)
+			return
+		}
+		credentials.Password = envPass
 	}
 
 	log.Printf("[%s] Received credentials: %s\\%s (database=%q)", tag, credentials.Domain, credentials.Username, decodeUTF16LE(loginFields.Database))
